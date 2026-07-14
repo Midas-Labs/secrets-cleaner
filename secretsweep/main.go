@@ -8,7 +8,9 @@ import (
 	"strings"
 )
 
-const version = "2.0.0"
+// version is the release version. It is overridden at build time via
+// -ldflags "-X main.version=..." (see the Makefile, formula, and GoReleaser).
+var version = "2.0.0"
 
 func main() {
 	var (

@@ -15,10 +15,13 @@ The interactive TUI is the default; a `--headless` mode runs the same flow for a
 ## Repository layout
 
 ```
-secretsweep/     # the tool (Go): discovery, Trivy scan, and the cleanup engine
-Makefile         # build / install and run scan / dry-run / prune
-CHANGE_REPORT.md # implementation and verification status
-LICENSE          # Apache License 2.0
+secretsweep/        # the tool (Go): discovery, Trivy scan, and the cleanup engine
+Formula/            # Homebrew formula (build from source)
+.goreleaser.yaml    # cross-platform release + tap publishing config
+.github/workflows/  # CI (build/test) and release (GoReleaser on tag)
+Makefile            # build / install and run scan / dry-run / prune
+CHANGE_REPORT.md    # implementation and verification status
+LICENSE             # Apache License 2.0
 ```
 
 ## Requirements
@@ -50,6 +53,20 @@ make check                     # go vet + unit tests
 ```
 
 `PATHS` accepts one or more repositories or folders (space separated), and defaults to the current directory. `make prune` is the one-command cleanup — build, discover, rewrite, verify — and refuses to run without an explicit `PATHS=` because the rewrite is irreversible.
+
+## Install with Homebrew
+
+Once the formula is published to the tap (see [Distributing via Homebrew](#distributing-via-homebrew)):
+
+```bash
+brew install midas-labs/tap/secretsweep
+```
+
+This pulls in `trivy` and `git-filter-repo` automatically. To install the latest development version directly from a checkout, without a tap:
+
+```bash
+brew install --HEAD ./Formula/secretsweep.rb
+```
 
 ## Build and install the binary
 
@@ -184,6 +201,39 @@ Rewriting history is necessary but not sufficient. Also:
 - Enable secret scanning and push protection on the hosting platform.
 
 Provider caches, pull-request views, forks, build logs, releases, backups, and existing clones may still require provider-specific cleanup.
+
+## Distributing via Homebrew
+
+`secretsweep` ships to Homebrew through a **tap** — a separate repository named `Midas-Labs/homebrew-tap` that holds the generated formula. Two things are needed once:
+
+1. **Create the tap repository** `Midas-Labs/homebrew-tap` (public, so `brew` can read it) with a top-level `Formula/` directory.
+2. **Add a token secret** `HOMEBREW_TAP_TOKEN` on this repository (or the org) — a fine-grained token with `contents: write` on `homebrew-tap` — so the release workflow can push the formula.
+
+Then every release is one tag:
+
+```bash
+git tag v2.1.0
+git push origin v2.1.0
+```
+
+The [release workflow](.github/workflows/release.yml) runs [GoReleaser](https://goreleaser.com), which:
+
+- builds `darwin`/`linux` × `amd64`/`arm64` binaries and a checksums file,
+- creates a GitHub release with those archives, and
+- updates `Formula/secretsweep.rb` in the tap to point at the new release (stamping the version and archive `sha256`).
+
+Users then get it with `brew install midas-labs/tap/secretsweep`.
+
+Validate the config and dry-run a build locally (requires `brew install goreleaser`):
+
+```bash
+make release-check      # goreleaser check
+make snapshot           # build release artifacts into ./dist without publishing
+```
+
+The in-repo [`Formula/secretsweep.rb`](Formula/secretsweep.rb) is a build-from-source formula (used for `brew install --HEAD`); the tap copy that GoReleaser maintains installs the pre-built binary instead.
+
+> Note: `brew` can only fetch from a **public** repository (or a tap configured with credentials). While this repository is private, use `make build` / `make install` or `brew install --HEAD ./Formula/secretsweep.rb` from a local checkout.
 
 ## License
 

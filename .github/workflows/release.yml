@@ -1,0 +1,32 @@
+name: Release
+
+# Tag a release (e.g. `git tag v2.0.0 && git push origin v2.0.0`) to build
+# cross-platform binaries and publish the Homebrew formula to the tap.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: secretsweep/go.sum
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A token with write access to Midas-Labs/homebrew-tap is required to
+          # publish the formula. Create it as a repo/org secret named HOMEBREW_TAP_TOKEN.
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}

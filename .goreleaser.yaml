@@ -1,0 +1,83 @@
+# GoReleaser configuration — builds cross-platform binaries for a tagged
+# release and publishes a Homebrew formula to the tap.
+#
+#   git tag v2.0.0 && git push origin v2.0.0
+#   goreleaser release --clean            # (or via .github/workflows/release.yml)
+#
+# The Go module lives in ./secretsweep, so builds run there.
+version: 2
+
+project_name: secretsweep
+
+before:
+  hooks:
+    - go -C secretsweep mod tidy
+
+builds:
+  - id: secretsweep
+    dir: secretsweep
+    main: .
+    binary: secretsweep
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: secretsweep
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Os }}_{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: Midas-Labs
+    name: secrets-cleaner
+
+# Publishes a Homebrew cask (macOS) with the released binary to the tap.
+# For source installs and Linuxbrew, the in-repo Formula/secretsweep.rb
+# (build from source) remains available.
+homebrew_casks:
+  - name: secretsweep
+    repository:
+      owner: Midas-Labs
+      name: homebrew-tap
+    homepage: "https://github.com/Midas-Labs/secrets-cleaner"
+    description: "Find and purge compromised API keys from Git history"
+    license: "Apache-2.0"
+    dependencies:
+      - formula: trivy
+      - formula: git-filter-repo
+    caveats: |
+      secretsweep needs `trivy` (secret discovery) and `git-filter-repo`
+      (history rewrite) at runtime; both are installed as dependencies.
+    # Remove the quarantine attribute so the unsigned binary runs on macOS.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr",
+                           args: ["-dr", "com.apple.quarantine", "#{staged_path}/secretsweep"],
+                           sudo: false
+          end

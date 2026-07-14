@@ -2,6 +2,14 @@
 
 Status: tested and ready for controlled use on disposable mirrors before organization rollout.
 
+## Homebrew packaging
+
+- `Formula/secretsweep.rb`: build-from-source Homebrew formula (`brew install --HEAD ./Formula/secretsweep.rb`), with `trivy` and `git-filter-repo` as runtime dependencies and a commented stable-release block.
+- `.goreleaser.yaml`: builds darwin/linux × amd64/arm64, publishes a GitHub release, and updates the formula in the `Midas-Labs/homebrew-tap` tap on each `v*` tag.
+- `.github/workflows/release.yml` runs GoReleaser on tag push; `.github/workflows/ci.yml` runs vet/build/test on pushes and PRs.
+- `version` is now stamped at build time via `-ldflags -X main.version` (Makefile injects `git describe`; verified an injected build reports the tag and a plain build keeps the source default).
+- Formula passes `ruby -c`; both runtime deps exist as Homebrew formulae. Publishing requires a public tap repo and a `HOMEBREW_TAP_TOKEN` secret (documented in the README); `brew` cannot install from this repo while it is private.
+
 ## secretsweep 2.0.0 — single self-contained tool
 
 The Bash engine (`clean-secret-from-repos.sh`) has been removed. All scanning,
