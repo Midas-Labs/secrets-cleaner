@@ -2,6 +2,12 @@
 
 Status: tested and ready for controlled use on disposable mirrors before organization rollout.
 
+## Makefile
+
+- `make build` / `make check` build and verify the secretsweep CLI; `make tui`, `make scan`, and `make dry-run` run it over `PATHS` (default: current directory).
+- `make prune PATHS=...` is the one-command cleanup: build, Trivy discovery, history rewrite, and verification. It refuses to run without an explicit `PATHS` because the rewrite is irreversible.
+- Verified: prune over a re-seeded fixture removed the planted key from all history; a report-only scan of this project's repositories found zero secrets.
+
 ## secretsweep 1.0.0 (Trivy + Bubble Tea TUI)
 
 - New Go tool in `secretsweep/` built on charmbracelet/bubbletea: discovers repositories, finds compromised keys automatically with Trivy secret scanning, and drives the bash cleanup engine (history scan, dry run, rewrite) from an interactive TUI or a `--headless` mode for automation.

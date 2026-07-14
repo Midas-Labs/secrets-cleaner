@@ -15,15 +15,24 @@ Two entry points are provided:
 
 ```bash
 brew install trivy go
-cd secretsweep && go build -o secretsweep .
+make build                                # builds secretsweep/secretsweep
 
 # Interactive: discover repos, Trivy-scan them, review findings, clean up
-./secretsweep ~/code /backups/mirrors
+make tui PATHS="~/code /backups/mirrors"
 
 # Headless (automation / CI)
-./secretsweep --headless ~/code                        # Trivy + full-history scan
-./secretsweep --headless --action dry-run ~/code       # preview the rewrite
-./secretsweep --headless --action rewrite --yes ~/code # rewrite and verify
+make scan PATHS=~/code                    # Trivy + full-history scan
+make dry-run PATHS=~/code                 # preview the rewrite
+make prune PATHS=~/code                   # find keys and rewrite history
+
+make check                                # go vet + unit tests
+```
+
+`make prune` is the one-command cleanup: it builds the CLI, finds compromised keys with Trivy, rewrites every matching history, and verifies the result. Because it is irreversible, it refuses to run without an explicit `PATHS=`. The binary can also be invoked directly:
+
+```bash
+./secretsweep/secretsweep ~/code /backups/mirrors      # TUI
+./secretsweep/secretsweep --headless --action rewrite --yes ~/code
 ```
 
 The TUI flow: repositories are discovered (single repos or folders, recursively), Trivy scans every working tree for secrets, findings appear in a table (severity, rule, location, masked value). From there `[s]` scans full Git history for the recovered keys, `[d]` previews the rewrite per repository, and `[r]` rewrites — after typing `rewrite` to confirm. Engine output streams into a scrollable viewport.
