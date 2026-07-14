@@ -71,6 +71,43 @@ secretsweep ~/code /backups/mirrors     # opens the interactive TUI
 
 The binary needs `trivy` and `git-filter-repo` on the `PATH` at runtime.
 
+## Zero-custody agent
+
+`make build` also produces `secretsweep/secretsweep-agent`. The agent polls the
+control API over outbound HTTPS, verifies Ed25519 signatures, decrypts commands
+with an agent-held X25519 key, rejects expired/replayed/cross-tenant commands,
+and returns an end-to-end encrypted result. The service never receives a raw
+secret, replacement string, or repository clone.
+
+Remote operations are intentionally restricted to `scan` and `dry-run`.
+History rewriting remains an interactive local operation with plan review and
+typed confirmation.
+
+Agent configuration is supplied through environment variables:
+
+```text
+SECRETSWEEP_TENANT_ID
+SECRETSWEEP_AGENT_ID
+SECRETSWEEP_CONTROL_URL
+SECRETSWEEP_AGENT_TOKEN
+SECRETSWEEP_BINARY
+SECRETSWEEP_X25519_PRIVATE
+SECRETSWEEP_CONTROL_X25519_PUBLIC
+SECRETSWEEP_CONTROL_ED25519_PUBLIC
+SECRETSWEEP_AGENT_ED25519_PRIVATE
+```
+
+Key values use standard base64. Store them in a local secret manager or an
+OpenBao agent template rather than a committed `.env` file.
+
+## Self-hosted services
+
+The low-cost reference profile lives in `deploy/compose`. It includes pinned
+PostgreSQL, Temporal, AutoMQ, RustFS, OpenBao, and OpenTelemetry containers.
+Stateful ports are not published; Temporal UI is available only on loopback.
+See `deploy/compose/README.md` for generated credentials, validation, startup,
+AutoMQ/RustFS smoke testing, and the production limitations of a single host.
+
 ## Interactive use
 
 Running `secretsweep PATH...` (or `make tui`) opens the TUI:

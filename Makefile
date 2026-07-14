@@ -16,14 +16,20 @@
 
 GO     ?= go
 BINARY := secretsweep/secretsweep
+AGENT_BINARY := secretsweep/secretsweep-agent
 PATHS  ?= .
 
-.PHONY: all build install check test test-race vet tui scan dry-run prune clean
+.PHONY: all build build-cli build-agent install check test test-race vet tui scan dry-run prune clean
 
 all: build
 
-build:
+build: build-cli build-agent
+
+build-cli:
 	cd secretsweep && $(GO) build -o secretsweep .
+
+build-agent:
+	cd secretsweep && $(GO) build -o secretsweep-agent ./cmd/secretsweep-agent
 
 install:
 	cd secretsweep && $(GO) install .
@@ -39,20 +45,20 @@ test-race:
 
 check: vet test-race
 
-tui: build
+tui: build-cli
 	./$(BINARY) $(PATHS)
 
-scan: build
+scan: build-cli
 	./$(BINARY) --headless --action scan $(PATHS)
 
-dry-run: build
+dry-run: build-cli
 	./$(BINARY) --headless --action dry-run $(PATHS)
 
-prune: build
+prune: build-cli
 ifeq ($(origin PATHS),file)
 	$(error make prune permanently rewrites Git history; pass the targets explicitly, e.g. make prune PATHS=/secure/work/mirrors)
 endif
 	./$(BINARY) --headless --action rewrite --yes $(PATHS)
 
 clean:
-	rm -f $(BINARY)
+	rm -f $(BINARY) $(AGENT_BINARY)

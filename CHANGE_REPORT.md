@@ -35,6 +35,15 @@ binary, with the interactive TUI as the default entry point.
 - **Testable plans.** TUI and headless execution share the same immutable
   cleanup plan and plan-aware engine. Real temporary Git repositories verify
   dry-run, scan, history replacement, and path deletion behavior.
+- **Encrypted agent foundation.** X25519/AES-GCM envelopes, Ed25519 signatures,
+  expiry, replay protection, tenant routing, outbound HTTPS polling, and a
+  non-destructive local executor are covered by unit and race tests.
+- **Self-hosted profile.** A security-checked Compose model provides PostgreSQL,
+  Temporal, AutoMQ, RustFS, OpenBao, and OpenTelemetry without public stateful
+  ports or demonstration credentials. Every pinned image reference was checked.
+- **Control API contract.** Authenticated agent leasing and idempotent encrypted
+  result submission are implemented behind a durable-store interface. The
+  PostgreSQL/outbox and Temporal/AutoMQ adapters remain the next service slice.
 
 ### Verification performed
 
