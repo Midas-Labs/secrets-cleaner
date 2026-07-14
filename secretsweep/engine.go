@@ -17,9 +17,6 @@ const (
 	ActionScan    EngineAction = "scan"
 	ActionDryRun  EngineAction = "dry-run"
 	ActionRewrite EngineAction = "rewrite"
-
-	// replacement is what every matched secret becomes in rewritten history.
-	replacement = "REMOVED_API_KEY"
 )
 
 // FilterRepoAvailable reports whether git-filter-repo can be executed.
@@ -35,9 +32,25 @@ func FilterRepoAvailable() bool {
 //	3  compromised material was found (scan or dry-run)
 //	4  a rewrite was skipped or failed verification for some repository
 func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
+	plan := CleanupPlan{DeletePaths: make(map[string][]string)}
+	for _, secret := range secrets {
+		plan.Replacements = append(plan.Replacements, ReplacementRule{Secret: secret, With: defaultReplacement})
+	}
+	return RunCleanupPlan(w, action, plan, repos)
+}
+
+// RunCleanupPlan executes an already-reviewed plan. Replacement secrets are
+// applied in every repository in which they occur, while DeletePaths are
+// scoped to the repository selected by the user.
+func RunCleanupPlan(w io.Writer, action EngineAction, plan CleanupPlan, repos []string) int {
+	secrets := make([]string, 0, len(plan.Replacements))
+	for _, rule := range plan.Replacements {
+		secrets = append(secrets, rule.Secret)
+	}
+
 	replaceFile := ""
 	if action == ActionRewrite {
-		path, cleanup, err := writeReplaceFile(secrets)
+		path, cleanup, err := writeReplacementRules(plan.Replacements)
 		if err != nil {
 			fmt.Fprintf(w, "Cannot prepare replacement rules: %v\n", err)
 			return 4
@@ -51,6 +64,7 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 	for i, repo := range repos {
 		fmt.Fprintf(w, "[%d/%d] Repository: %s\n", i+1, len(repos), repo)
 		bare := isBareRepo(repo)
+		deletePaths := plan.DeletePaths[repo]
 
 		currentMatch := false
 		if bare {
@@ -72,7 +86,7 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 			fmt.Fprintln(w, "  Full object database: clear")
 		}
 
-		if !currentMatch && !objectMatch {
+		if !currentMatch && !objectMatch && len(deletePaths) == 0 {
 			fmt.Fprintln(w, "")
 			continue
 		}
@@ -96,7 +110,13 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 			} else {
 				fmt.Fprintln(w, "  Action: would rewrite history (all fetchable origin refs)")
 			}
-			fmt.Fprintf(w, "    Command: git -C %s filter-repo %s\n", repo, strings.Join(filterRepoArgs("<replacement-rules>", noFetch), " "))
+			for _, file := range deletePaths {
+				fmt.Fprintf(w, "    would DELETE from history: %s\n", file)
+			}
+			if len(plan.Replacements) > 0 {
+				fmt.Fprintf(w, "    would REPLACE %d selected secret everywhere with %s\n", len(plan.Replacements), replacementSummary(plan.Replacements))
+			}
+			fmt.Fprintf(w, "    Command: git -C %s filter-repo %s\n", repo, strings.Join(filterRepoArgsForPlan("<replacement-rules>", noFetch, deletePaths), " "))
 			fmt.Fprintln(w, "    Then: verify every remaining Git object against the recovered secrets.")
 			fmt.Fprintln(w, "")
 			wouldRewrite++
@@ -113,7 +133,7 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 				fmt.Fprintln(w, "  Warning: no origin remote; only locally available refs can be rewritten.")
 			}
 			fmt.Fprintln(w, "  Rewriting history...")
-			if err := runFilterRepo(w, repo, replaceFile, noFetch); err != nil {
+			if err := runFilterRepoPlan(w, repo, replaceFile, noFetch, deletePaths); err != nil {
 				fmt.Fprintf(w, "  Action: FAILED (%v)\n\n", err)
 				skipped++
 				continue
@@ -125,6 +145,13 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 				skipped++
 			} else if remaining {
 				fmt.Fprintln(w, "  Action: FAILED VERIFICATION (a secret remains in the object database)")
+				fmt.Fprintln(w, "")
+				skipped++
+			} else if pathsRemain, err := historyPathsMatch(repo, deletePaths); err != nil {
+				fmt.Fprintf(w, "  Action: FAILED VERIFICATION (%v)\n\n", err)
+				skipped++
+			} else if pathsRemain {
+				fmt.Fprintln(w, "  Action: FAILED VERIFICATION (a deleted path remains in reachable history)")
 				fmt.Fprintln(w, "")
 				skipped++
 			} else {
@@ -157,15 +184,37 @@ func RunEngine(w io.Writer, action EngineAction, secrets, repos []string) int {
 	return 0
 }
 
+func replacementSummary(rules []ReplacementRule) string {
+	if len(rules) == 0 {
+		return "(none)"
+	}
+	first := rules[0].With
+	for _, rule := range rules[1:] {
+		if rule.With != first {
+			return "reviewed replacement strings"
+		}
+	}
+	return first
+}
+
 // filterRepoArgs is the git-filter-repo argument list; replaceFile is either a
 // real path or a placeholder used when printing a dry-run plan.
 func filterRepoArgs(replaceFile string, noFetch bool) []string {
+	return filterRepoArgsForPlan(replaceFile, noFetch, nil)
+}
+
+func filterRepoArgsForPlan(replaceFile string, noFetch bool, deletePaths []string) []string {
 	args := []string{
 		"--replace-text", replaceFile,
 		"--replace-message", replaceFile,
-		"--sensitive-data-removal",
-		"--force",
 	}
+	if len(deletePaths) > 0 {
+		args = append(args, "--invert-paths")
+		for _, file := range deletePaths {
+			args = append(args, "--path", file)
+		}
+	}
+	args = append(args, "--sensitive-data-removal", "--force")
 	if noFetch {
 		args = append(args, "--no-fetch")
 	}
@@ -173,7 +222,11 @@ func filterRepoArgs(replaceFile string, noFetch bool) []string {
 }
 
 func runFilterRepo(w io.Writer, repo, replaceFile string, noFetch bool) error {
-	args := append([]string{"-C", repo, "filter-repo"}, filterRepoArgs(replaceFile, noFetch)...)
+	return runFilterRepoPlan(w, repo, replaceFile, noFetch, nil)
+}
+
+func runFilterRepoPlan(w io.Writer, repo, replaceFile string, noFetch bool, deletePaths []string) error {
+	args := append([]string{"-C", repo, "filter-repo"}, filterRepoArgsForPlan(replaceFile, noFetch, deletePaths)...)
 	cmd := exec.Command("git", args...)
 	cmd.Stdout = w
 	cmd.Stderr = w
@@ -184,6 +237,14 @@ func runFilterRepo(w io.Writer, repo, replaceFile string, noFetch bool) error {
 // secret is written as an exact (literal) match so no regex metacharacter in a
 // key is misinterpreted.
 func writeReplaceFile(secrets []string) (string, func(), error) {
+	rules := make([]ReplacementRule, 0, len(secrets))
+	for _, secret := range secrets {
+		rules = append(rules, ReplacementRule{Secret: secret, With: defaultReplacement})
+	}
+	return writeReplacementRules(rules)
+}
+
+func writeReplacementRules(rules []ReplacementRule) (string, func(), error) {
 	f, err := os.CreateTemp("", "secretsweep-replace-*")
 	if err != nil {
 		return "", nil, err
@@ -194,8 +255,8 @@ func writeReplaceFile(secrets []string) (string, func(), error) {
 		cleanup()
 		return "", nil, err
 	}
-	for _, s := range secrets {
-		if _, err := fmt.Fprintf(f, "literal:%s==>%s\n", s, replacement); err != nil {
+	for _, rule := range rules {
+		if _, err := fmt.Fprintf(f, "literal:%s==>%s\n", rule.Secret, rule.With); err != nil {
 			f.Close()
 			cleanup()
 			return "", nil, err
@@ -206,6 +267,19 @@ func writeReplaceFile(secrets []string) (string, func(), error) {
 		return "", nil, err
 	}
 	return f.Name(), cleanup, nil
+}
+
+func historyPathsMatch(repo string, paths []string) (bool, error) {
+	if len(paths) == 0 {
+		return false, nil
+	}
+	args := []string{"-C", repo, "log", "--all", "--format=", "--name-only", "--"}
+	args = append(args, paths...)
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
 }
 
 // currentTreeMatch reports whether any secret appears in the repository's
