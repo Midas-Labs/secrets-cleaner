@@ -134,6 +134,11 @@ func (r *ReviewState) SetAction(finding Finding, action ReviewAction) error {
 		if finding.Secret == "" {
 			return errors.New("finding has no recoverable secret and must be reviewed manually")
 		}
+		if action == ActionDeleteFile {
+			if finding.Repo == "" {
+				return errors.New("finding is not associated with a repository file")
+			}
+		}
 		r.actions[finding.StableID()] = action
 		return nil
 	default:
@@ -149,7 +154,11 @@ func (r *ReviewState) CycleCurrentAction() error {
 	next := ActionReplace
 	switch r.ActionFor(finding) {
 	case ActionReplace:
-		next = ActionDeleteFile
+		if finding.Repo == "" {
+			next = ActionNone
+		} else {
+			next = ActionDeleteFile
+		}
 	case ActionDeleteFile:
 		next = ActionNone
 	}

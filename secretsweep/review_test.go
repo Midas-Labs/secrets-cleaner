@@ -91,6 +91,23 @@ func TestReviewRejectsSelectingUnrecoveredFinding(t *testing.T) {
 	}
 }
 
+func TestReviewManualKeyCannotBecomeDeleteFileAction(t *testing.T) {
+	finding := Finding{File: "key-file entry 1", RuleID: "manual-key", Secret: token("ghp_", 36)}
+	review := NewReviewState([]Finding{finding})
+	if err := review.SetAction(finding, ActionReplace); err != nil {
+		t.Fatal(err)
+	}
+	if err := review.CycleCurrentAction(); err != nil {
+		t.Fatal(err)
+	}
+	if got := review.ActionFor(finding); got != ActionNone {
+		t.Fatalf("manual-key action = %q; want none after replace", got)
+	}
+	if err := review.SetAction(finding, ActionDeleteFile); err == nil {
+		t.Fatal("manual key without a repository path must reject delete-file")
+	}
+}
+
 func TestBuildCleanupPlanReplacesSameSecretEverywhereOnce(t *testing.T) {
 	findings, first, _ := reviewFindings(t)
 	review := NewReviewState(findings)

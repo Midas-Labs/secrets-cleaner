@@ -21,6 +21,9 @@ const (
 	phaseDiscover phase = iota
 	phaseScan
 	phaseReview
+	phaseSearch
+	phaseReplacement
+	phasePreview
 	phaseConfirm
 	phaseRun
 	phaseDone
@@ -32,6 +35,11 @@ var (
 	styleDanger   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
 	styleOK       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
 	styleWarn     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleInfo     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	styleCritical = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("196"))
+	styleHigh     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("208"))
+	styleMedium   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	styleLow      = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	styleHelp     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	styleViewport = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("241")).Padding(0, 1)
 )
@@ -70,6 +78,11 @@ type model struct {
 
 	tbl          table.Model
 	confirmInput textinput.Model
+	searchInput  textinput.Model
+	replaceInput textinput.Model
+	review       ReviewState
+	pendingPlan  CleanupPlan
+	notice       string
 
 	viewport    viewport.Model
 	engineLines []string
@@ -86,9 +99,19 @@ func newModel(targets, extraKeys []string) model {
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
 
 	ti := textinput.New()
-	ti.Placeholder = "rewrite"
+	ti.Placeholder = "apply"
 	ti.CharLimit = 16
 	ti.Width = 24
+
+	search := textinput.New()
+	search.Placeholder = "severity, rule, repository, or path"
+	search.CharLimit = 160
+	search.Width = 52
+
+	replace := textinput.New()
+	replace.Placeholder = defaultReplacement
+	replace.CharLimit = 256
+	replace.Width = 52
 
 	vp := viewport.New(80, 16)
 
@@ -98,9 +121,31 @@ func newModel(targets, extraKeys []string) model {
 		phase:        phaseDiscover,
 		spinner:      sp,
 		confirmInput: ti,
+		searchInput:  search,
+		replaceInput: replace,
 		viewport:     vp,
 		engineExit:   -1,
 	}
+}
+
+func (m *model) enterReview() {
+	findings := append([]Finding(nil), m.findings...)
+	for i, secret := range m.extraKeys {
+		findings = append(findings, Finding{
+			File:     fmt.Sprintf("key-file entry %d", i+1),
+			RuleID:   "manual-key",
+			Title:    "Explicit history-only key",
+			Severity: "MANUAL",
+			Secret:   secret,
+		})
+	}
+	sort.SliceStable(findings, func(i, j int) bool {
+		return severityRank(findings[i].Severity) < severityRank(findings[j].Severity)
+	})
+	m.review = NewReviewState(findings)
+	m.phase = phaseReview
+	m.notice = ""
+	m.rebuildTable()
 }
 
 // allSecrets is the full set of keys to act on: those recovered from Trivy
@@ -129,10 +174,12 @@ func scanCmd(repo string, index int) tea.Cmd {
 }
 
 func (m *model) startEngine(action EngineAction) tea.Cmd {
-	secrets := m.allSecrets()
-	if len(secrets) == 0 {
+	plan, err := BuildCleanupPlan(m.review)
+	if err != nil {
+		m.notice = humanPlanError(err)
 		return nil
 	}
+	m.pendingPlan = plan
 	ch := make(chan engineEvMsg, 256)
 	m.engineCh = ch
 	m.engineLines = nil
@@ -142,12 +189,20 @@ func (m *model) startEngine(action EngineAction) tea.Cmd {
 	repos := m.repos
 	go func() {
 		w := &channelWriter{ch: ch}
-		code := RunEngine(w, action, secrets, repos)
+		code := RunCleanupPlan(w, action, plan, repos)
 		w.flush()
 		ch <- engineEvMsg{done: true, exit: code}
 		close(ch)
 	}()
 	return listenEngine(ch)
+}
+
+func humanPlanError(err error) string {
+	message := err.Error()
+	if strings.HasPrefix(message, "select at least one") {
+		return "Select at least one recovered finding before continuing."
+	}
+	return message
 }
 
 // channelWriter is an io.Writer that forwards each complete line written to it
@@ -224,8 +279,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// No Trivy, but --key-file supplied: skip discovery, act on those keys.
-			m.phase = phaseReview
-			m.rebuildTable()
+			m.enterReview()
 			return m, nil
 		}
 		m.phase = phaseScan
@@ -241,8 +295,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scanIndex = msg.index + 1
 			return m, scanCmd(m.repos[m.scanIndex], m.scanIndex)
 		}
-		m.phase = phaseReview
-		m.rebuildTable()
+		m.enterReview()
 		return m, nil
 
 	case engineEvMsg:
@@ -261,18 +314,92 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch m.phase {
-	case phaseConfirm:
+	case phaseSearch:
+		switch msg.String() {
+		case "esc", "enter":
+			m.phase = phaseReview
+			m.searchInput.Blur()
+			m.rebuildTable()
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		case "ctrl+u":
+			m.searchInput.SetValue("")
+			m.review.SetQuery("")
+			m.rebuildTable()
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.searchInput, cmd = m.searchInput.Update(msg)
+		m.review.SetQuery(m.searchInput.Value())
+		m.rebuildTable()
+		return m, cmd
+
+	case phaseReplacement:
 		switch msg.String() {
 		case "esc":
 			m.phase = phaseReview
+			m.replaceInput.Blur()
+			m.notice = "Replacement edit cancelled."
+			return m, nil
+		case "ctrl+c":
+			return m, tea.Quit
+		case "ctrl+u":
+			m.replaceInput.SetValue("")
+			return m, nil
+		case "enter":
+			if err := ValidateReplacement(m.replaceInput.Value(), m.allSecrets()); err != nil {
+				m.notice = err.Error()
+				return m, nil
+			}
+			m.review.Replacement = m.replaceInput.Value()
+			m.replaceInput.Blur()
+			m.phase = phaseReview
+			m.notice = "Replacement updated. Preview the plan before applying."
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.replaceInput, cmd = m.replaceInput.Update(msg)
+		return m, cmd
+
+	case phasePreview:
+		switch msg.String() {
+		case "esc", "b":
+			m.phase = phaseReview
+			m.notice = ""
+			return m, nil
+		case "d":
+			return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionDryRun))
+		case "r", "enter":
+			if !FilterRepoAvailable() {
+				m.notice = "rewrite requires git-filter-repo; install it before applying"
+				return m, nil
+			}
+			m.phase = phaseConfirm
+			m.confirmInput.Reset()
+			m.confirmInput.Focus()
+			m.notice = ""
+			return m, textinput.Blink
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		}
+		var cmd tea.Cmd
+		m.viewport, cmd = m.viewport.Update(msg)
+		return m, cmd
+
+	case phaseConfirm:
+		switch msg.String() {
+		case "esc":
+			m.phase = phasePreview
 			m.confirmInput.Reset()
 			return m, nil
 		case "enter":
-			if m.confirmInput.Value() == "rewrite" {
+			if m.confirmInput.Value() == "apply" {
 				m.confirmInput.Reset()
 				return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionRewrite))
 			}
 			m.confirmInput.Reset()
+			m.notice = `Type "apply" exactly to authorize the rewrite.`
 			return m, nil
 		case "ctrl+c":
 			return m, tea.Quit
@@ -285,32 +412,62 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
-		case "s":
-			if len(m.allSecrets()) == 0 {
+		case "/":
+			m.phase = phaseSearch
+			m.searchInput.SetValue(m.review.Query())
+			m.searchInput.CursorEnd()
+			m.searchInput.Focus()
+			m.notice = ""
+			return m, textinput.Blink
+		case "up", "k":
+			m.review.Move(-1)
+			m.rebuildTable()
+			return m, nil
+		case "down", "j":
+			m.review.Move(1)
+			m.rebuildTable()
+			return m, nil
+		case "pgup":
+			m.review.Move(-10)
+			m.rebuildTable()
+			return m, nil
+		case "pgdown":
+			m.review.Move(10)
+			m.rebuildTable()
+			return m, nil
+		case " ":
+			if err := m.review.CycleCurrentAction(); err != nil {
+				m.notice = err.Error()
+			} else {
+				m.notice = ""
+			}
+			m.rebuildTable()
+			return m, nil
+		case "e":
+			m.phase = phaseReplacement
+			m.replaceInput.SetValue(m.review.Replacement)
+			m.replaceInput.CursorEnd()
+			m.replaceInput.Focus()
+			m.notice = ""
+			return m, textinput.Blink
+		case "p", "enter":
+			plan, err := BuildCleanupPlan(m.review)
+			if err != nil {
+				m.notice = humanPlanError(err)
 				return m, nil
 			}
+			m.pendingPlan = plan
+			m.viewport.SetContent(renderPlan(plan, m.repos))
+			m.viewport.GotoTop()
+			m.phase = phasePreview
+			m.notice = ""
+			return m, nil
+		case "s":
 			return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionScan))
 		case "d":
-			if len(m.allSecrets()) == 0 {
-				return m, nil
-			}
 			return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionDryRun))
-		case "r":
-			if len(m.allSecrets()) == 0 {
-				return m, nil
-			}
-			if !FilterRepoAvailable() {
-				m.err = fmt.Errorf("rewrite requires git-filter-repo; install it with: brew install git-filter-repo")
-				m.phase = phaseDone
-				return m, nil
-			}
-			m.phase = phaseConfirm
-			m.confirmInput.Focus()
-			return m, textinput.Blink
 		}
-		var cmd tea.Cmd
-		m.tbl, cmd = m.tbl.Update(msg)
-		return m, cmd
+		return m, nil
 
 	case phaseRun:
 		if msg.String() == "ctrl+c" {
@@ -347,40 +504,80 @@ func (m *model) rebuildTable() {
 	if width == 0 {
 		width = 100
 	}
-	fileWidth := max(24, width-78)
-	columns := []table.Column{
-		{Title: "Severity", Width: 8},
-		{Title: "Rule", Width: 20},
-		{Title: "Repository", Width: 22},
-		{Title: "File:Line", Width: fileWidth},
-		{Title: "Secret", Width: 20},
+	tableWidth := width
+	if width >= 90 {
+		tableWidth = width*2/3 - 3
 	}
-	sorted := make([]Finding, len(m.findings))
-	copy(sorted, m.findings)
-	sort.SliceStable(sorted, func(i, j int) bool {
-		return severityRank(sorted[i].Severity) < severityRank(sorted[j].Severity)
-	})
-	rows := make([]table.Row, 0, len(sorted))
-	for _, f := range sorted {
+	fileWidth := max(18, tableWidth-58)
+	columns := []table.Column{
+		{Title: "Action", Width: 11},
+		{Title: "Severity", Width: 9},
+		{Title: "Rule", Width: 16},
+		{Title: "Repository", Width: 16},
+		{Title: "File:Line", Width: fileWidth},
+	}
+	visible := m.review.Visible()
+	rows := make([]table.Row, 0, len(visible))
+	for _, f := range visible {
+		repoName := filepath.Base(f.Repo)
+		if f.Repo == "" {
+			repoName = "all repos"
+		}
 		rows = append(rows, table.Row{
+			actionLabel(m.review.ActionFor(f)),
 			f.Severity,
 			f.RuleID,
-			filepath.Base(f.Repo),
+			repoName,
 			fmt.Sprintf("%s:%d", f.File, f.Line),
-			f.Masked(),
 		})
 	}
 	t := table.New(
 		table.WithColumns(columns),
 		table.WithRows(rows),
 		table.WithFocused(true),
-		table.WithHeight(min(12, max(3, len(rows)+1))),
+		table.WithHeight(min(max(6, m.height-14), max(3, len(rows)+1))),
 	)
 	styles := table.DefaultStyles()
 	styles.Header = styles.Header.Bold(true).BorderStyle(lipgloss.NormalBorder()).BorderBottom(true).BorderForeground(lipgloss.Color("241"))
 	styles.Selected = styles.Selected.Foreground(lipgloss.Color("229")).Background(lipgloss.Color("57"))
 	t.SetStyles(styles)
+	if len(rows) > 0 {
+		t.SetCursor(min(m.review.Cursor(), len(rows)-1))
+	}
 	m.tbl = t
+}
+
+func actionLabel(action ReviewAction) string {
+	switch action {
+	case ActionReplace:
+		return "● replace"
+	case ActionDeleteFile:
+		return "× delete"
+	default:
+		return "○ none"
+	}
+}
+
+func renderPlan(plan CleanupPlan, repos []string) string {
+	var b strings.Builder
+	b.WriteString("Exact cleanup plan\n\n")
+	fmt.Fprintf(&b, "REPLACE  %d selected secret(s) everywhere with %s\n", len(plan.Replacements), replacementSummary(plan.Replacements))
+	deleteCount := 0
+	for _, repo := range repos {
+		for _, file := range plan.DeletePaths[repo] {
+			deleteCount++
+			fmt.Fprintf(&b, "DELETE   %s from all history in %s\n", file, repo)
+		}
+	}
+	if deleteCount == 0 {
+		b.WriteString("DELETE   no files\n")
+	}
+	b.WriteString("\nSafety checks\n")
+	b.WriteString("• Dirty working repositories will be skipped.\n")
+	b.WriteString("• Every selected secret is verified against all remaining Git objects.\n")
+	b.WriteString("• Deleted paths are checked against reachable history.\n")
+	b.WriteString("• No remote is pushed automatically.\n")
+	return b.String()
 }
 
 func severityRank(severity string) int {
@@ -397,6 +594,98 @@ func severityRank(severity string) int {
 	return 4
 }
 
+func severityBadge(severity string) string {
+	switch severity {
+	case "CRITICAL":
+		return styleCritical.Render(severity)
+	case "HIGH":
+		return styleHigh.Render(severity)
+	case "MEDIUM":
+		return styleMedium.Render(severity)
+	case "LOW":
+		return styleLow.Render(severity)
+	default:
+		return styleInfo.Render(severity)
+	}
+}
+
+func (m model) reviewView(searching bool) string {
+	var b strings.Builder
+	visible := m.review.Visible()
+	all := m.allSecrets()
+	_, unrecovered := UniqueSecrets(m.findings)
+	fmt.Fprintf(&b, "Repositories: %d    Findings: %d    Visible: %d    Selected: %d    Distinct secrets: %d\n",
+		len(m.repos), len(m.findings)+len(m.extraKeys), len(visible), m.review.SelectedCount(), len(all))
+	if m.review.Query() != "" {
+		b.WriteString(styleInfo.Render(fmt.Sprintf("Filter: %q", m.review.Query())) + "\n")
+	}
+	if unrecovered > 0 {
+		b.WriteString(styleWarn.Render(fmt.Sprintf("%d finding(s) could not be recovered and cannot be selected automatically.", unrecovered)) + "\n")
+	}
+	for _, scanErr := range m.scanErrs {
+		b.WriteString(styleWarn.Render("scan error: "+scanErr) + "\n")
+	}
+	if m.notice != "" {
+		b.WriteString(styleWarn.Render(m.notice) + "\n")
+	}
+	if searching {
+		b.WriteString("\nSearch: " + m.searchInput.View() + "\n")
+		b.WriteString(styleHelp.Render("Type to filter   [ctrl+u] clear   [enter/esc] return to report") + "\n")
+	}
+	b.WriteString("\n")
+	if len(visible) == 0 {
+		if len(all) == 0 {
+			b.WriteString(styleOK.Render("No recoverable secrets found in any working tree.") + "\n")
+		} else {
+			b.WriteString(styleWarn.Render("No findings match the current search.") + "\n")
+		}
+	} else {
+		detail := m.findingDetail()
+		if m.width >= 90 {
+			leftWidth := m.width*2/3 - 3
+			left := lipgloss.NewStyle().Width(leftWidth).Render(m.tbl.View())
+			right := styleViewport.Width(max(24, m.width-leftWidth-7)).Render(detail)
+			b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right))
+		} else {
+			b.WriteString(m.tbl.View())
+			b.WriteString("\n")
+			b.WriteString(styleViewport.Render(detail))
+		}
+		b.WriteString("\n")
+	}
+	if !searching {
+		b.WriteString(styleHelp.Render("[↑/↓] navigate   [space] none→replace→delete   [/] search   [e] replacement   [p] preview   [s] history scan   [d] dry-run   [q] quit") + "\n")
+	}
+	return b.String()
+}
+
+func (m model) findingDetail() string {
+	finding, ok := m.review.Current()
+	if !ok {
+		return "No finding selected"
+	}
+	var b strings.Builder
+	b.WriteString(severityBadge(finding.Severity) + "  " + styleTitle.Render(finding.RuleID) + "\n\n")
+	b.WriteString(finding.Title + "\n")
+	if finding.Repo == "" {
+		b.WriteString("Repository: all discovered repositories\n")
+	} else {
+		b.WriteString("Repository: " + filepath.Base(finding.Repo) + "\n")
+	}
+	fmt.Fprintf(&b, "Location: %s:%d\n", finding.File, finding.Line)
+	b.WriteString("Secret: " + finding.Masked() + "\n")
+	b.WriteString("Action: " + actionLabel(m.review.ActionFor(finding)) + "\n\n")
+	switch m.review.ActionFor(finding) {
+	case ActionReplace:
+		b.WriteString("Replace this secret in every repository and all Git history.")
+	case ActionDeleteFile:
+		b.WriteString("Delete this path from this repository's history and replace the secret everywhere else.")
+	default:
+		b.WriteString("No change will be made for this finding.")
+	}
+	return b.String()
+}
+
 func (m model) View() string {
 	var b strings.Builder
 	b.WriteString(styleTitle.Render("secretsweep") + styleSubtle.Render("  find and purge compromised keys") + "\n\n")
@@ -408,41 +697,52 @@ func (m model) View() string {
 	case phaseScan:
 		fmt.Fprintf(&b, "%s Trivy secret scan  [%d/%d]  %s\n",
 			m.spinner.View(), m.scanIndex+1, len(m.repos), m.repos[m.scanIndex])
+		fmt.Fprintf(&b, "%s\n", styleInfo.Render(fmt.Sprintf("Found: %d", len(m.findings))))
+		if len(m.findings) > 0 {
+			latest := m.findings[len(m.findings)-1]
+			fmt.Fprintf(&b, "Latest: %s  %s:%d  %s\n", severityBadge(latest.Severity), latest.File, latest.Line, latest.Masked())
+		}
 
 	case phaseReview:
-		all := m.allSecrets()
-		_, unrecovered := UniqueSecrets(m.findings)
-		fmt.Fprintf(&b, "Repositories: %d    Findings: %d    Distinct secrets: %d\n",
-			len(m.repos), len(m.findings), len(all))
-		if unrecovered > 0 {
-			b.WriteString(styleWarn.Render(fmt.Sprintf("%d finding(s) could not be auto-recovered; review them manually.", unrecovered)) + "\n")
+		b.WriteString(m.reviewView(false))
+
+	case phaseSearch:
+		b.WriteString(m.reviewView(true))
+
+	case phaseReplacement:
+		b.WriteString(styleInfo.Render("Replacement text") + "\n")
+		b.WriteString("The selected compromised value will be replaced everywhere it occurs.\n")
+		b.WriteString("Use a plain, non-secret, single-line marker.\n\n")
+		b.WriteString(m.replaceInput.View() + "\n")
+		if m.notice != "" {
+			b.WriteString(styleWarn.Render(m.notice) + "\n")
 		}
-		if len(m.extraKeys) > 0 {
-			b.WriteString(styleSubtle.Render(fmt.Sprintf("%d key(s) supplied via --key-file.", len(m.extraKeys))) + "\n")
+		b.WriteString(styleHelp.Render("[enter] save   [ctrl+u] clear   [esc] cancel") + "\n")
+
+	case phasePreview:
+		b.WriteString(styleInfo.Render("Review before changing history") + "\n")
+		b.WriteString(styleViewport.Render(m.viewport.View()) + "\n")
+		if m.notice != "" {
+			b.WriteString(styleWarn.Render(m.notice) + "\n")
 		}
-		for _, e := range m.scanErrs {
-			b.WriteString(styleWarn.Render("scan error: "+e) + "\n")
-		}
-		b.WriteString("\n")
-		if len(all) == 0 {
-			b.WriteString(styleOK.Render("No secrets found in any working tree.") + "\n\n")
-			b.WriteString(styleHelp.Render("[q] quit") + "\n")
-		} else {
-			if len(m.findings) > 0 {
-				b.WriteString(m.tbl.View() + "\n\n")
-			} else {
-				b.WriteString(styleSubtle.Render("Acting on --key-file keys (no working-tree findings).") + "\n\n")
-			}
-			b.WriteString(styleHelp.Render("[s] scan full history   [d] dry-run rewrite   [r] rewrite history   [↑/↓] browse   [q] quit") + "\n")
-		}
+		b.WriteString(styleHelp.Render("[d] execute dry-run   [r/enter] continue to confirmation   [b/esc] back") + "\n")
 
 	case phaseConfirm:
-		secrets := m.allSecrets()
 		b.WriteString(styleDanger.Render("Rewrite mode permanently rewrites Git history in every matching repository.") + "\n")
-		fmt.Fprintf(&b, "%d distinct secret(s) across %d repositories will be replaced with REMOVED_API_KEY.\n", len(secrets), len(m.repos))
+		fmt.Fprintf(&b, "%d selected secret(s) across %d repositories will be replaced with %s.\n", len(m.pendingPlan.Replacements), len(m.repos), replacementSummary(m.pendingPlan.Replacements))
+		deleteCount := 0
+		for _, paths := range m.pendingPlan.DeletePaths {
+			deleteCount += len(paths)
+		}
+		if deleteCount > 0 {
+			fmt.Fprintf(&b, "%d selected file path(s) will be removed from their repository history.\n", deleteCount)
+		}
 		b.WriteString("Confirm the keys are revoked and backups exist.\n\n")
-		b.WriteString("Type \"rewrite\" to continue, esc to go back:\n")
+		b.WriteString("Type \"apply\" to continue, esc to go back:\n")
 		b.WriteString(m.confirmInput.View() + "\n")
+		if m.notice != "" {
+			b.WriteString(styleWarn.Render(m.notice) + "\n")
+		}
 
 	case phaseRun:
 		fmt.Fprintf(&b, "%s Engine %s in progress...\n", m.spinner.View(), m.ranAction)

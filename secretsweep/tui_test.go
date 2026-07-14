@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,6 +33,168 @@ func initGitRepo(t *testing.T, secret string) string {
 	run("add", ".")
 	run("commit", "-qm", "add")
 	return dir
+}
+
+func tuiReviewModel(t *testing.T) (model, []Finding, string) {
+	t.Helper()
+	findings, secret, _ := reviewFindings(t)
+	m := newModel([]string{"."}, nil)
+	m.width, m.height = 120, 36
+	m.repos = []string{findings[0].Repo, findings[1].Repo}
+	m.findings = findings
+	m.enterReview()
+	return m, findings, secret
+}
+
+func key(r rune) tea.KeyMsg {
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}}
+}
+
+func specialKey(keyType tea.KeyType) tea.KeyMsg {
+	return tea.KeyMsg{Type: keyType}
+}
+
+func updateKey(t *testing.T, m model, msg tea.KeyMsg) model {
+	t.Helper()
+	updated, _ := m.Update(msg)
+	return updated.(model)
+}
+
+func TestTUIReviewStartsWithNothingSelected(t *testing.T) {
+	m, _, _ := tuiReviewModel(t)
+	if m.phase != phaseReview {
+		t.Fatalf("phase = %v; want phaseReview", m.phase)
+	}
+	if m.review.SelectedCount() != 0 {
+		t.Fatalf("selected = %d; want 0", m.review.SelectedCount())
+	}
+	if !strings.Contains(m.View(), "Selected: 0") {
+		t.Fatalf("review view does not make empty selection clear:\n%s", m.View())
+	}
+}
+
+func TestTUISearchAndBackPreserveSelection(t *testing.T) {
+	m, findings, _ := tuiReviewModel(t)
+	m = updateKey(t, m, key(' '))
+	if m.review.ActionFor(findings[0]) != ActionReplace {
+		t.Fatal("space did not select the current finding for replacement")
+	}
+
+	m = updateKey(t, m, key('/'))
+	if m.phase != phaseSearch {
+		t.Fatalf("phase = %v; want phaseSearch", m.phase)
+	}
+	for _, r := range "stripe" {
+		m = updateKey(t, m, key(r))
+	}
+	if visible := m.review.Visible(); len(visible) != 1 || visible[0].RuleID != "stripe-secret" {
+		t.Fatalf("search results = %#v", visible)
+	}
+	m = updateKey(t, m, specialKey(tea.KeyEsc))
+	if m.phase != phaseReview {
+		t.Fatalf("escape phase = %v; want review", m.phase)
+	}
+	m.review.SetQuery("")
+	if m.review.ActionFor(findings[0]) != ActionReplace {
+		t.Fatal("selection was lost after searching and going back")
+	}
+}
+
+func TestTUIActionCyclesAndNavigation(t *testing.T) {
+	m, findings, _ := tuiReviewModel(t)
+	m = updateKey(t, m, specialKey(tea.KeyDown))
+	current, _ := m.review.Current()
+	if current.StableID() != findings[1].StableID() {
+		t.Fatalf("down selected %s; want %s", current.File, findings[1].File)
+	}
+	m = updateKey(t, m, key(' '))
+	if m.review.ActionFor(findings[1]) != ActionReplace {
+		t.Fatal("first space must choose replace")
+	}
+	m = updateKey(t, m, key(' '))
+	if m.review.ActionFor(findings[1]) != ActionDeleteFile {
+		t.Fatal("second space must choose delete-file")
+	}
+	m = updateKey(t, m, key(' '))
+	if m.review.ActionFor(findings[1]) != ActionNone {
+		t.Fatal("third space must clear the action")
+	}
+}
+
+func TestTUIPreviewRequiresSelectionAndNeverLeaksSecret(t *testing.T) {
+	m, _, secret := tuiReviewModel(t)
+	m = updateKey(t, m, key('p'))
+	if m.phase != phaseReview || !strings.Contains(m.notice, "Select at least one") {
+		t.Fatalf("empty preview phase=%v notice=%q", m.phase, m.notice)
+	}
+	m = updateKey(t, m, key(' '))
+	m = updateKey(t, m, key('p'))
+	if m.phase != phasePreview {
+		t.Fatalf("phase = %v; want phasePreview (notice %q)", m.phase, m.notice)
+	}
+	view := m.View()
+	for _, want := range []string{"Exact cleanup plan", "REPLACE", defaultReplacement} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("preview missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, secret) {
+		t.Fatal("preview leaked the raw secret")
+	}
+}
+
+func TestTUIEditsAndValidatesReplacement(t *testing.T) {
+	m, _, _ := tuiReviewModel(t)
+	m = updateKey(t, m, key(' '))
+	m = updateKey(t, m, key('e'))
+	if m.phase != phaseReplacement {
+		t.Fatalf("phase = %v; want phaseReplacement", m.phase)
+	}
+	m = updateKey(t, m, specialKey(tea.KeyCtrlU))
+	for _, r := range "SAFE_VALUE" {
+		m = updateKey(t, m, key(r))
+	}
+	m = updateKey(t, m, specialKey(tea.KeyEnter))
+	if m.phase != phaseReview || m.review.Replacement != "SAFE_VALUE" {
+		t.Fatalf("replacement edit failed: phase=%v value=%q notice=%q", m.phase, m.review.Replacement, m.notice)
+	}
+}
+
+func TestTUIConfirmationRequiresExactWord(t *testing.T) {
+	m, _, _ := tuiReviewModel(t)
+	m = updateKey(t, m, key(' '))
+	m = updateKey(t, m, key('p'))
+	m = updateKey(t, m, key('r'))
+	if m.phase != phaseConfirm {
+		t.Fatalf("phase = %v; want confirm", m.phase)
+	}
+	for _, r := range "wrong" {
+		m = updateKey(t, m, key(r))
+	}
+	m = updateKey(t, m, specialKey(tea.KeyEnter))
+	if m.phase != phaseConfirm {
+		t.Fatalf("incorrect confirmation escaped confirm phase: %v", m.phase)
+	}
+	if !strings.Contains(m.notice, `Type "apply" exactly`) {
+		t.Fatalf("notice = %q", m.notice)
+	}
+}
+
+func TestScanViewReportsFindingsAsTheyArrive(t *testing.T) {
+	m := newModel([]string{"."}, nil)
+	m.phase = phaseScan
+	m.repos = []string{"/repos/one", "/repos/two"}
+	m.scanIndex = 0
+	secret := token("ghp_", 36)
+	updated, _ := m.Update(scannedMsg{index: 0, findings: []Finding{{Repo: m.repos[0], File: "config.env", Line: 4, RuleID: "github-pat", Severity: "CRITICAL", Secret: secret}}})
+	m = updated.(model)
+	view := m.View()
+	if !strings.Contains(view, "Found: 1") || !strings.Contains(view, "config.env:4") {
+		t.Fatalf("scan progress does not show live finding feedback:\n%s", view)
+	}
+	if strings.Contains(view, secret) {
+		t.Fatal("scan progress leaked the raw secret")
+	}
 }
 
 // pump drives the model through its message loop, executing each returned
@@ -79,6 +242,14 @@ func TestEngineStreamsToDone(t *testing.T) {
 	m := newModel([]string{repo}, nil)
 	m.repos = []string{repo}
 	m.findings = []Finding{{Repo: repo, File: "conf", Line: 1, Secret: secret, Severity: "CRITICAL", RuleID: "github-pat"}}
+	m.enterReview()
+	current, ok := m.review.Current()
+	if !ok {
+		t.Fatal("review has no current finding")
+	}
+	if err := m.review.SetAction(current, ActionReplace); err != nil {
+		t.Fatal(err)
+	}
 
 	cmd := m.startEngine(ActionScan)
 	if cmd == nil {
