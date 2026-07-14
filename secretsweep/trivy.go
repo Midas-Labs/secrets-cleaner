@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -18,6 +19,15 @@ type Finding struct {
 	Title    string
 	Severity string
 	Secret   string // exact recovered secret; empty when recovery failed
+}
+
+// StableID identifies a finding across filtering and sorting without placing
+// the raw secret in UI state or logs.
+func (f Finding) StableID() string {
+	secretDigest := sha256.Sum256([]byte(f.Secret))
+	material := fmt.Sprintf("%s\x00%s\x00%d\x00%s\x00%x", f.Repo, f.File, f.Line, f.RuleID, secretDigest)
+	digest := sha256.Sum256([]byte(material))
+	return fmt.Sprintf("fnd_%x", digest[:12])
 }
 
 // Masked returns a display-safe form of the secret.
