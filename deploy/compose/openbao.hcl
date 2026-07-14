@@ -1,8 +1,7 @@
 ui = false
-disable_mlock = false
 
 storage "raft" {
-  path    = "/openbao/data"
+  path    = "/openbao/file"
   node_id = "compose-1"
 }
 

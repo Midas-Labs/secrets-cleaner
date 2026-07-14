@@ -64,6 +64,56 @@ func TestComposeOnlyLoopbackPortsArePublished(t *testing.T) {
 	}
 }
 
+func TestComposeRuntimeHardeningIsCompatibleWithPinnedImages(t *testing.T) {
+	data, err := os.ReadFile("../deploy/compose/compose.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	temporal := composeServiceBlock(text, "temporal")
+	if !strings.Contains(temporal, "temporal-config:/etc/temporal/config") {
+		t.Fatal("Temporal auto-setup needs a writable, container-initialized config volume")
+	}
+	if strings.Contains(temporal, "development-sql.yaml") {
+		t.Fatal("Temporal 1.28.1 does not contain the old development-sql dynamic config")
+	}
+	if !strings.Contains(temporal, "temporal operator cluster health --address temporal:7233") {
+		t.Fatal("Temporal healthcheck must use the bundled CLI and the IPv6-compatible service address")
+	}
+	rustfs := composeServiceBlock(text, "rustfs")
+	if !strings.Contains(rustfs, "nc -z 127.0.0.1 9000") {
+		t.Fatal("RustFS healthcheck must use the nc binary present in the pinned image")
+	}
+	openbao := composeServiceBlock(text, "openbao")
+	if !strings.Contains(openbao, `user: "100:1000"`) {
+		t.Fatal("OpenBao must start as its image user when SETGID is dropped")
+	}
+	if !strings.Contains(openbao, "openbao-data:/openbao/file") {
+		t.Fatal("OpenBao data volume must use the image-owned /openbao/file directory")
+	}
+	hcl, err := os.ReadFile("../deploy/compose/openbao.hcl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(hcl), `path    = "/openbao/file"`) {
+		t.Fatal("OpenBao Raft storage must match the image-owned data directory")
+	}
+	if strings.Contains(string(hcl), "disable_mlock") {
+		t.Fatal("OpenBao 2.3 rejects the removed disable_mlock setting")
+	}
+	if !strings.Contains(openbao, "BAO_ADDR=http://127.0.0.1:8200") {
+		t.Fatal("OpenBao healthcheck must explicitly use the configured HTTP listener")
+	}
+	rustfsInit := composeServiceBlock(text, "rustfs-init")
+	if !strings.Contains(rustfsInit, "MC_CONFIG_DIR: /tmp/.mc") {
+		t.Fatal("read-only MinIO Client needs its config redirected to writable tmpfs")
+	}
+	automq := composeServiceBlock(text, "automq")
+	if !strings.Contains(automq, "/opt/automq/kafka/logs") {
+		t.Fatal("read-only AutoMQ needs a writable tmpfs for Kafka and GC logs")
+	}
+}
+
 func composeServiceBlock(compose, service string) string {
 	marker := "  " + service + ":\n"
 	start := strings.Index(compose, marker)

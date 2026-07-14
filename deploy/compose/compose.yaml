@@ -31,13 +31,14 @@ services:
       POSTGRES_SEEDS: postgres
       POSTGRES_USER: temporal
       POSTGRES_PWD: ${POSTGRES_PASSWORD:?generate a database password}
-      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - temporal-config:/etc/temporal/config
     tmpfs: [/tmp]
     healthcheck:
-      test: ["CMD", "/etc/temporal/healthcheck"]
+      test: ["CMD-SHELL", "temporal operator cluster health --address temporal:7233"]
       interval: 15s
       timeout: 5s
       retries: 20
@@ -75,7 +76,7 @@ services:
       - rustfs-data:/data
     tmpfs: [/tmp]
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -fsS http://localhost:9000/health"]
+      test: ["CMD", "sh", "-c", "nc -z 127.0.0.1 9000"]
       interval: 15s
       timeout: 5s
       retries: 12
@@ -88,6 +89,7 @@ services:
     read_only: true
     restart: "no"
     environment:
+      MC_CONFIG_DIR: /tmp/.mc
       RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?generate an object-store access key}
       RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?generate an object-store secret key}
     depends_on:
@@ -135,7 +137,9 @@ services:
         condition: service_healthy
       rustfs-init:
         condition: service_completed_successfully
-    tmpfs: [/tmp]
+    tmpfs:
+      - /tmp
+      - /opt/automq/kafka/logs
     healthcheck:
       test: ["CMD", "bash", "-c", "/opt/automq/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
       interval: 15s
@@ -150,14 +154,14 @@ services:
     read_only: true
     restart: unless-stopped
     command: ["server", "-config=/openbao/config/server.hcl"]
+    user: "100:1000"
     cap_drop: [ALL]
-    cap_add: [IPC_LOCK]
     volumes:
       - ./openbao.hcl:/openbao/config/server.hcl:ro
-      - openbao-data:/openbao/data
+      - openbao-data:/openbao/file
     tmpfs: [/tmp]
     healthcheck:
-      test: ["CMD", "sh", "-c", "bao status >/dev/null 2>&1 || [ $$? -eq 2 ]"]
+      test: ["CMD", "sh", "-c", "BAO_ADDR=http://127.0.0.1:8200 bao status >/dev/null 2>&1; code=$$?; [ $$code -eq 0 ] || [ $$code -eq 2 ]"]
       interval: 15s
       timeout: 5s
       retries: 12
@@ -182,5 +186,6 @@ networks:
 
 volumes:
   postgres-data:
+  temporal-config:
   rustfs-data:
   openbao-data:
