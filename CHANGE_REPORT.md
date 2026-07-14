@@ -2,9 +2,20 @@
 
 Status: tested and ready for controlled use on disposable mirrors before organization rollout.
 
+## CLI 2.0.0
+
+- Accepts multiple target paths in one run; each path may be a single repository (working clone, worktree, bare, or mirror) or a folder searched recursively. Duplicate targets are scanned once. Defaults to the current directory.
+- `--dry-run` mode: full scan plus the exact per-repository rewrite plan (would rewrite or would skip, including the `git filter-repo` command), with nothing modified.
+- `--list` mode: prints the repositories a run would cover without requiring key input.
+- `--no-recurse`: requires every path to be a repository itself.
+- Rewrite mode asks for a typed confirmation (`rewrite`); `--yes` skips it for unattended runs, and non-interactive runs without `--yes` are refused.
+- Colored MATCH/clear output with `[n/N]` progress counters; disabled via `--no-color`, the `NO_COLOR` environment variable, or when stdout is not a terminal.
+- Options may appear anywhere on the command line; `--key-file=FILE` form, `--version`, expanded `--help` with examples, and conflicting-mode detection added.
+- Verified on macOS Bash 3.2: scan/dry-run/rewrite against fixtures covering clean, infected, dirty-working-tree, bare-mirror, and no-origin repositories, exact and masked keys, and all documented exit codes (0, 2, 3, 4).
+
 ## Current capabilities
 
-- Discovers ordinary, worktree, bare, and mirror Git repositories below one folder.
+- Discovers ordinary, worktree, bare, and mirror Git repositories below any number of target folders, or accepts repositories directly as targets.
 - Accepts multiple exact compromised keys.
 - Accepts masked patterns using runs of two or more asterisks at the start, middle, end, or both ends.
 - Requires at least four visible characters in each mask.

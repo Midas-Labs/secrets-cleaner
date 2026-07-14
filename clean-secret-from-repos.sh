@@ -1,40 +1,102 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage:
-  clean-secret-from-repos.sh [--scan|--rewrite] [--fetch-all] --key-file KEYS_FILE ROOT_FOLDER
-  API_KEY='one-exposed-key' clean-secret-from-repos.sh [--scan|--rewrite] [--fetch-all] ROOT_FOLDER
+VERSION="2.0.0"
+SCRIPT_NAME=$(basename "$0")
 
-Modes:
-  --scan       Audit all local refs and Git objects without editing (default).
-  --rewrite    Fetch all origin refs, rewrite them, and verify every Git object.
+usage() {
+  cat <<EOF
+${SCRIPT_NAME} ${VERSION} — find and remove compromised API keys from Git history.
+
+Usage:
+  ${SCRIPT_NAME} [OPTIONS] [PATH ...]
+
+Each PATH may be a single Git repository (working clone, worktree, bare, or
+mirror) or a folder that is searched recursively for repositories. Several
+paths may be mixed freely; duplicates are scanned once. When no PATH is
+given, the current directory is used.
+
+Modes (mutually exclusive; default: --scan):
+  --scan            Report-only audit of refs and Git objects. Never edits.
+  --dry-run         Everything --scan does, plus the exact rewrite plan for
+                    each matching repository. Never edits.
+  --rewrite         Rewrite matching histories with git-filter-repo and
+                    verify every remaining Git object. Asks for typed
+                    confirmation unless --yes is given. Never pushes.
+
+Key sources (pick one):
+  --key-file FILE   One exact key or mask per non-empty line (format below).
+  API_KEY=...       Environment variable holding one exposed key.
+  (neither)         Silent interactive prompt for one key.
 
 Options:
-  --fetch-all  Refresh all configured remotes and tags before a scan.
+  --fetch-all       Refresh all configured remotes and tags before scanning.
+  --no-recurse      Require every PATH to be a repository itself; do not
+                    search subfolders.
+  --list            List the repositories that would be scanned, then exit.
+                    Needs no key input.
+  -y, --yes         Skip the interactive confirmation in rewrite mode.
+  --no-color        Disable colored output (the NO_COLOR environment
+                    variable is also honored).
+  -V, --version     Print the version and exit.
+  -h, --help        Show this help and exit.
 
-The script discovers Git repositories recursively. Rewrite mode does not push;
-review the results before force-pushing branches and tags yourself.
+Key file format:
+  Exact keys and masks such as prefix**, **suffix, or prefix***suffix. Any
+  run of 2+ asterisks is one mask covering unknown token characters. Every
+  mask must expose at least 4 characters. Use literal:KEY when a key really
+  contains asterisks. Blank lines are ignored.
 
-KEYS_FILE accepts exact keys and masks such as prefix**, **suffix, or prefix***suffix.
-Any run of 2+ asterisks is one mask. Expose 4+ characters; use literal:KEY for real asterisks.
-For a single key, set API_KEY or omit it to use the silent prompt.
+Examples:
+  # Audit a single repository
+  ${SCRIPT_NAME} --scan ~/code/api
+
+  # Audit several targets at once (repos and folders can be mixed)
+  ${SCRIPT_NAME} --key-file keys.txt ~/code/api ~/code/web /backups/mirrors
+
+  # Preview exactly what a rewrite would do, without changing anything
+  ${SCRIPT_NAME} --dry-run --key-file keys.txt /secure/work/org-cleanup
+
+  # Rewrite after review (still requires typed confirmation)
+  ${SCRIPT_NAME} --rewrite --key-file keys.txt /secure/work/org-cleanup
+
+  # Unattended rewrite of two specific repositories
+  ${SCRIPT_NAME} --rewrite --yes --no-recurse --key-file keys.txt \\
+    /secure/work/api.git /secure/work/web.git
+
+Exit status:
+  0  no compromised material found (or --list / --help / --version)
+  2  usage, confirmation, or environment error
+  3  scan or dry run found compromised material
+  4  rewrite mode skipped or failed at least one matching repository
+
+Rewrite mode never pushes; review each repository before force-pushing.
 EOF
 }
 
 mode="scan"
+mode_flag=""
 key_file=""
 fetch_all=false
-if [[ ${1:-} == "--help" || ${1:-} == "-h" ]]; then
-  usage
-  exit 0
-fi
+no_recurse=false
+list_only=false
+assume_yes=false
+no_color=false
+targets=()
+
+set_mode() {
+  if [[ -n $mode_flag && $mode_flag != "$1" ]]; then
+    printf 'Conflicting modes: %s and %s\n' "$mode_flag" "$1" >&2
+    exit 2
+  fi
+  mode_flag=$1
+  mode=${1#--}
+}
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --scan|--rewrite)
-      mode="${1#--}"
+    --scan|--rewrite|--dry-run)
+      set_mode "$1"
       shift
       ;;
     --key-file)
@@ -45,45 +107,161 @@ while [[ $# -gt 0 ]]; do
       key_file=$2
       shift 2
       ;;
+    --key-file=*)
+      key_file=${1#*=}
+      shift
+      ;;
     --fetch-all)
       fetch_all=true
       shift
       ;;
-    --help|-h)
+    --no-recurse)
+      no_recurse=true
+      shift
+      ;;
+    --list|--list-repos)
+      list_only=true
+      shift
+      ;;
+    -y|--yes)
+      assume_yes=true
+      shift
+      ;;
+    --no-color)
+      no_color=true
+      shift
+      ;;
+    -V|--version)
+      printf '%s %s\n' "$SCRIPT_NAME" "$VERSION"
+      exit 0
+      ;;
+    -h|--help)
       usage
       exit 0
       ;;
-    --*)
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        targets+=("$1")
+        shift
+      done
+      ;;
+    -*)
       printf 'Unknown option: %s\n' "$1" >&2
-      usage >&2
+      printf 'Run %s --help for usage.\n' "$SCRIPT_NAME" >&2
       exit 2
       ;;
     *)
-      break
+      targets+=("$1")
+      shift
       ;;
   esac
 done
 
-if [[ $# -ne 1 ]]; then
-  usage >&2
-  exit 2
+if (( ${#targets[@]} == 0 )); then
+  targets=(".")
 fi
 
-root=$1
-if [[ ! -d $root ]]; then
-  printf 'Folder does not exist: %s\n' "$root" >&2
-  exit 2
+if [[ $no_color == false && -z ${NO_COLOR:-} && -t 1 ]]; then
+  c_red=$'\033[31m'
+  c_green=$'\033[32m'
+  c_yellow=$'\033[33m'
+  c_bold=$'\033[1m'
+  c_dim=$'\033[2m'
+  c_reset=$'\033[0m'
+else
+  c_red=""
+  c_green=""
+  c_yellow=""
+  c_bold=""
+  c_dim=""
+  c_reset=""
 fi
+
+for target in "${targets[@]}"; do
+  if [[ ! -d $target ]]; then
+    printf 'Folder does not exist: %s\n' "$target" >&2
+    exit 2
+  fi
+done
 
 if [[ -n $key_file && ! -f $key_file ]]; then
   printf 'Key file does not exist: %s\n' "$key_file" >&2
   exit 2
 fi
 
-if [[ $mode == "rewrite" ]] && ! command -v git-filter-repo >/dev/null 2>&1; then
+have_filter_repo=true
+if ! command -v git-filter-repo >/dev/null 2>&1; then
+  have_filter_repo=false
+fi
+if [[ $mode == "rewrite" && $have_filter_repo == false ]]; then
   printf 'Rewrite mode requires git-filter-repo. Install it with: brew install git-filter-repo\n' >&2
   exit 1
 fi
+
+# --- Repository discovery ---------------------------------------------------
+
+repos=()
+
+add_repo() {
+  local candidate=$1 resolved existing
+  resolved=$(cd "$candidate" 2>/dev/null && pwd -P) || resolved=$candidate
+  for existing in ${repos[@]+"${repos[@]}"}; do
+    if [[ $existing == "$resolved" ]]; then
+      return 0
+    fi
+  done
+  repos+=("$resolved")
+}
+
+path_is_repo() {
+  local path=$1
+  if [[ -d $path/.git || -f $path/.git ]]; then
+    return 0
+  fi
+  git -C "$path" rev-parse --is-bare-repository 2>/dev/null | grep -qx true
+}
+
+discover_repos() {
+  local target=$1 git_dir
+  while IFS= read -r -d '' git_dir; do
+    if [[ -d $git_dir && $(basename "$git_dir") == ".git" ]]; then
+      add_repo "${git_dir%/.git}"
+    elif [[ -f $git_dir && $(basename "$git_dir") == ".git" ]]; then
+      add_repo "${git_dir%/.git}"
+    elif git -C "$git_dir" rev-parse --is-bare-repository 2>/dev/null | grep -qx true; then
+      add_repo "$git_dir"
+    fi
+  done < <(find "$target" \( -type d -name .git -o -type f -name .git -o -type d -name '*.git' \) -print0 2>/dev/null)
+}
+
+for target in "${targets[@]}"; do
+  if path_is_repo "$target"; then
+    add_repo "$target"
+    if [[ $no_recurse == true ]]; then
+      continue
+    fi
+  elif [[ $no_recurse == true ]]; then
+    printf 'Not a Git repository (every PATH must be one with --no-recurse): %s\n' "$target" >&2
+    exit 2
+  fi
+  discover_repos "$target"
+done
+
+if (( ${#repos[@]} == 0 )); then
+  printf 'No Git repositories found under: %s\n' "${targets[*]}"
+  exit 0
+fi
+
+if [[ $list_only == true ]]; then
+  printf '%d Git repositories found:\n' "${#repos[@]}"
+  for repo in "${repos[@]}"; do
+    printf '  %s\n' "$repo"
+  done
+  exit 0
+fi
+
+# --- Key pattern loading -----------------------------------------------------
 
 scan_pattern_file=$(mktemp)
 replacement_file=$(mktemp)
@@ -205,27 +383,43 @@ if (( key_count == 0 )); then
   exit 2
 fi
 
-repos=()
-while IFS= read -r -d '' git_dir; do
-  if [[ -d $git_dir && $(basename "$git_dir") == ".git" ]]; then
-    repos+=("${git_dir%/.git}")
-  elif [[ -f $git_dir && $(basename "$git_dir") == ".git" ]]; then
-    repos+=("${git_dir%/.git}")
-  elif git -C "$git_dir" rev-parse --is-bare-repository 2>/dev/null | grep -qx true; then
-    repos+=("$git_dir")
-  fi
-done < <(find "$root" \( -type d -name .git -o -type f -name .git -o -type d -name '*.git' \) -print0 2>/dev/null)
+# --- Run ---------------------------------------------------------------------
 
-if (( ${#repos[@]} == 0 )); then
-  printf 'No Git repositories found under %s\n' "$root"
-  exit 0
+case $mode in
+  scan) mode_label="scan (report only)" ;;
+  dry-run) mode_label="dry run (rewrite preview; nothing is modified)" ;;
+  rewrite) mode_label="rewrite" ;;
+esac
+
+printf '%sMode:%s %s\n' "$c_bold" "$c_reset" "$mode_label"
+printf 'Loaded %d compromised key patterns (%d exact, %d masked).\n' "$key_count" "$exact_count" "$masked_count"
+printf 'Found %d Git repositories across %d target path(s).\n\n' "${#repos[@]}" "${#targets[@]}"
+
+if [[ $mode == "dry-run" && $have_filter_repo == false ]]; then
+  printf '%sNote:%s git-filter-repo is not installed; --rewrite will fail until you run: brew install git-filter-repo\n\n' \
+    "$c_yellow" "$c_reset"
 fi
 
-printf 'Loaded %d compromised key patterns (%d exact, %d masked).\n' "$key_count" "$exact_count" "$masked_count"
-printf 'Found %d Git repositories under %s\n\n' "${#repos[@]}" "$root"
+if [[ $mode == "rewrite" && $assume_yes == false ]]; then
+  printf '%sRewrite mode permanently rewrites Git history in every matching repository.%s\n' "$c_bold" "$c_reset"
+  printf 'Confirm that the exposed keys are revoked and backups exist before continuing.\n'
+  if [[ ! -t 0 ]]; then
+    printf 'Standard input is not a terminal; re-run with --yes to confirm non-interactively.\n' >&2
+    exit 2
+  fi
+  read -r -p 'Type "rewrite" to continue: ' confirmation
+  if [[ $confirmation != "rewrite" ]]; then
+    printf 'Aborted; no repository was modified.\n'
+    exit 2
+  fi
+  printf '\n'
+fi
+
 matches=0
 rewritten=0
 skipped=0
+would_rewrite=0
+would_skip=0
 infected_branches_total=0
 
 object_database_has_match() {
@@ -243,14 +437,29 @@ object_database_has_match() {
   return 1
 }
 
+# Populates filter_args for the given repository. Returns 1 when the
+# repository has no origin remote, in which case --no-fetch is included.
+build_filter_args() {
+  local repo=$1
+  filter_args=(--replace-text "$replacement_file" --replace-message "$replacement_file" --sensitive-data-removal --force)
+  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+    filter_args+=(--no-fetch)
+    return 1
+  fi
+  return 0
+}
+
+repo_index=0
 for repo in "${repos[@]}"; do
-  printf 'Repository: %s\n' "$repo"
+  ((repo_index += 1))
+  printf '%s[%d/%d]%s Repository: %s%s%s\n' \
+    "$c_dim" "$repo_index" "${#repos[@]}" "$c_reset" "$c_bold" "$repo" "$c_reset"
 
   bare=$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null || printf false)
   if [[ $fetch_all == true ]]; then
     printf '  Refreshing all configured remotes and tags...\n'
     if ! git -C "$repo" fetch --all --prune --tags; then
-      printf '  Action: SKIPPED (fetch failed)\n\n' >&2
+      printf '  Action: %sSKIPPED%s (fetch failed)\n\n' "$c_yellow" "$c_reset" >&2
       ((skipped += 1))
       continue
     fi
@@ -266,9 +475,9 @@ for repo in "${repos[@]}"; do
     printf '  Current tracked files: n/a (bare or mirror repository)\n'
   elif git -C "$repo" grep -I -E -f "$scan_pattern_file" -- . >/dev/null 2>&1; then
     current_match=true
-    printf '  Current tracked files: MATCH\n'
+    printf '  Current tracked files: %sMATCH%s\n' "$c_red" "$c_reset"
   else
-    printf '  Current tracked files: clear\n'
+    printf '  Current tracked files: %sclear%s\n' "$c_green" "$c_reset"
   fi
 
   # Build the set of infected commits once, then map it to every branch ref.
@@ -281,10 +490,9 @@ for repo in "${repos[@]}"; do
   done < <(git -C "$repo" rev-list --all)
 
   if [[ $history_match == true ]]; then
-    history_match=true
-    printf '  Reachable Git history: MATCH\n'
+    printf '  Reachable Git history: %sMATCH%s\n' "$c_red" "$c_reset"
   else
-    printf '  Reachable Git history: clear\n'
+    printf '  Reachable Git history: %sclear%s\n' "$c_green" "$c_reset"
   fi
 
   infected_branches=0
@@ -309,9 +517,9 @@ for repo in "${repos[@]}"; do
   printf '  Full Git object database: scanning...\n'
   if object_database_has_match "$repo"; then
     object_match=true
-    printf '  Full Git object database: MATCH\n'
+    printf '  Full Git object database: %sMATCH%s\n' "$c_red" "$c_reset"
   else
-    printf '  Full Git object database: clear\n'
+    printf '  Full Git object database: %sclear%s\n' "$c_green" "$c_reset"
   fi
 
   if [[ $current_match == false && $history_match == false && $object_match == false ]]; then
@@ -327,45 +535,77 @@ for repo in "${repos[@]}"; do
     continue
   fi
 
+  if [[ $mode == "dry-run" ]]; then
+    rm -f "$infected_commits"
+    if [[ $bare != true && -n $(git -C "$repo" status --porcelain) ]]; then
+      printf '  Action: %swould SKIP%s (working tree has uncommitted changes)\n\n' "$c_yellow" "$c_reset"
+      ((would_skip += 1))
+      continue
+    fi
+    if build_filter_args "$repo"; then
+      printf '  Action: %swould rewrite history%s (all fetchable origin refs)\n' "$c_yellow" "$c_reset"
+    else
+      printf '  Action: %swould rewrite history%s (no origin remote; locally available refs only)\n' "$c_yellow" "$c_reset"
+    fi
+    printf '    Command: git -C %q filter-repo' "$repo"
+    for arg in "${filter_args[@]}"; do
+      case $arg in
+        "$replacement_file") printf ' <replacement-rules>' ;;
+        *) printf ' %q' "$arg" ;;
+      esac
+    done
+    printf '\n    Then: verify every remaining Git object against the key patterns.\n\n'
+    ((would_rewrite += 1))
+    continue
+  fi
+
   if [[ $bare != true && -n $(git -C "$repo" status --porcelain) ]]; then
     rm -f "$infected_commits"
-    printf '  Action: SKIPPED (working tree has uncommitted changes)\n\n' >&2
+    printf '  Action: %sSKIPPED%s (working tree has uncommitted changes)\n\n' "$c_yellow" "$c_reset" >&2
     ((skipped += 1))
     continue
   fi
 
   printf '  Rewriting history...\n'
-  filter_args=(--replace-text "$replacement_file" --replace-message "$replacement_file" --sensitive-data-removal --force)
-  if ! git -C "$repo" remote get-url origin >/dev/null 2>&1; then
+  if ! build_filter_args "$repo"; then
     printf '  Warning: no origin remote; only locally available refs can be rewritten.\n' >&2
-    filter_args+=(--no-fetch)
   fi
   if git -C "$repo" filter-repo "${filter_args[@]}"; then
     rm -f "$infected_commits"
 
     printf '  Verifying every remaining Git object...\n'
     if object_database_has_match "$repo"; then
-      printf '  Action: FAILED VERIFICATION (a supplied key remains in the object database)\n\n' >&2
+      printf '  Action: %sFAILED VERIFICATION%s (a supplied key remains in the object database)\n\n' "$c_red" "$c_reset" >&2
       ((skipped += 1))
     else
-      printf '  Action: rewritten and verified; inspect before pushing\n\n'
+      printf '  Action: %srewritten and verified%s; inspect before pushing\n\n' "$c_green" "$c_reset"
       ((rewritten += 1))
     fi
   else
     rm -f "$infected_commits"
-    printf '  Action: FAILED\n\n' >&2
+    printf '  Action: %sFAILED%s\n\n' "$c_red" "$c_reset" >&2
     ((skipped += 1))
   fi
 done
 
-printf 'Summary: %d matching repositories, %d infected branches, %d rewritten, %d skipped\n' \
-  "$matches" "$infected_branches_total" "$rewritten" "$skipped"
+if [[ $mode == "dry-run" ]]; then
+  printf 'Summary: %d matching repositories, %d infected branches, %d would be rewritten, %d would be skipped\n' \
+    "$matches" "$infected_branches_total" "$would_rewrite" "$would_skip"
+else
+  printf 'Summary: %d matching repositories, %d infected branches, %d rewritten, %d skipped\n' \
+    "$matches" "$infected_branches_total" "$rewritten" "$skipped"
+fi
 
-if [[ $mode == "scan" && $matches -gt 0 ]]; then
-  printf 'Re-run with --rewrite only after revoking the exposed key and backing up your repositories.\n'
+if [[ $mode == "scan" ]] && (( matches > 0 )); then
+  printf 'Re-run with --dry-run to preview the rewrite, then --rewrite after revoking the exposed keys and backing up your repositories.\n'
   exit 3
 fi
 
-if [[ $mode == "rewrite" && $skipped -gt 0 ]]; then
+if [[ $mode == "dry-run" ]] && (( matches > 0 )); then
+  printf 'Dry run only: nothing was modified. Re-run with --rewrite after revoking the exposed keys and backing up your repositories.\n'
+  exit 3
+fi
+
+if [[ $mode == "rewrite" ]] && (( skipped > 0 )); then
   exit 4
 fi

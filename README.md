@@ -1,6 +1,6 @@
 # Compromised API Key Cleanup
 
-This utility scans every Git repository below a folder for compromised API keys, including keys that exist only in earlier commits, branch histories, tags, commit messages, and unreachable local Git objects. After a report-only scan, it can replace every confirmed compromised key across all fetched refs and verify the complete local object database.
+This utility scans Git repositories for compromised API keys, including keys that exist only in earlier commits, branch histories, tags, commit messages, and unreachable local Git objects. It accepts one or more target paths; each path may be a single repository (working clone, worktree, bare, or mirror) or a folder that is searched recursively. After a report-only scan and an optional dry run of the rewrite plan, it can replace every confirmed compromised key across all fetched refs and verify the complete local object database.
 
 `CHANGE_REPORT.md` records the current implementation and verification status. The `archive` folder contains the earlier report snapshot and is retained only for history; it is superseded by the current README and change report.
 
@@ -86,7 +86,13 @@ The utility can refresh all configured remotes before its report-only scan by us
 
 ## 3. Scan every repository, ref, and object
 
-Run the report-only scan first:
+Preview which repositories a run would cover (no key input needed):
+
+```bash
+./clean-secret-from-repos.sh --list /secure/work/org-cleanup
+```
+
+Then run the report-only scan:
 
 ```bash
 ./clean-secret-from-repos.sh \
@@ -96,7 +102,24 @@ Run the report-only scan first:
   /secure/work/org-cleanup
 ```
 
-The script recursively discovers repositories and reports, for each one:
+Targets can also be a single repository, or any mix of repositories and folders:
+
+```bash
+# One repository
+./clean-secret-from-repos.sh --scan --key-file keys.txt ~/code/api
+
+# Several repositories and folders in one run (duplicates are scanned once)
+./clean-secret-from-repos.sh --scan --key-file keys.txt \
+  ~/code/api ~/code/web /secure/work/org-cleanup
+
+# Require every path to be a repository itself (no recursive search)
+./clean-secret-from-repos.sh --scan --no-recurse --key-file keys.txt \
+  /secure/work/api.git /secure/work/web.git
+```
+
+When no path is given, the current directory is used.
+
+The script discovers repositories and reports, for each one:
 
 - Whether a supplied exact key or masked key pattern exists in current tracked files for working clones
 - Whether a supplied exact key or masked key pattern exists in any commit reachable from any local ref
@@ -115,9 +138,22 @@ For one compromised key, a silent prompt is also available:
 
 For the reported case, the scan summary should account for the initial 240 infected branches. A different count means the local mirrors or the compromised-key inventory need investigation before rewriting.
 
-## 4. Rewrite all fetched histories
+## 4. Dry-run the rewrite
 
-After reviewing the scan, revoking the keys, and backing up the repositories, run:
+Before touching anything, preview exactly what rewrite mode would do:
+
+```bash
+./clean-secret-from-repos.sh \
+  --dry-run \
+  --key-file /secure/path/compromised-keys.txt \
+  /secure/work/org-cleanup
+```
+
+A dry run performs the full scan and then, for each matching repository, reports whether it would be rewritten or skipped (for example because of uncommitted changes), including the exact `git filter-repo` invocation that rewrite mode would execute. Nothing is modified; the exit status is `3` when compromised material is found, matching scan mode.
+
+## 5. Rewrite all fetched histories
+
+After reviewing the scan and dry run, revoking the keys, and backing up the repositories, run:
 
 ```bash
 ./clean-secret-from-repos.sh \
@@ -125,6 +161,8 @@ After reviewing the scan, revoking the keys, and backing up the repositories, ru
   --key-file /secure/path/compromised-keys.txt \
   /secure/work/org-cleanup
 ```
+
+Rewrite mode asks for a typed confirmation (`rewrite`) before touching anything. Pass `--yes` for unattended runs; without it, a non-interactive invocation refuses to proceed.
 
 Rewrite mode:
 
@@ -140,7 +178,7 @@ Rewrite mode:
 
 If a repository has no `origin`, the utility cannot fetch missing server refs. It warns, rewrites locally available refs, and performs local verification only.
 
-## 5. Review and publish each cleaned repository
+## 6. Review and publish each cleaned repository
 
 Inside each rewritten mirror, inspect its refs and remote:
 
@@ -164,7 +202,7 @@ git -C /secure/work/org-cleanup/repository-name.git push --force --mirror origin
 
 Only use `--mirror` from a deliberately created and reviewed mirror clone. It replaces all remote refs represented by the mirror. Force-pushing changes commit IDs; existing clones and forks can reintroduce the compromised history, so collaborators should delete old clones and clone the cleaned repository again.
 
-## 6. Verify the published result
+## 7. Verify the published result
 
 Delete the local mirror, create a new mirror from the server, and run the full scan again:
 
@@ -190,7 +228,7 @@ This fresh-clone verification proves what the server currently advertises to the
 
 Use the actual HTTPS or SSH server URL for verification. A clone made directly from another local filesystem path may copy unreachable objects through Git's local-clone optimization and is not an accurate simulation of what the server advertises over the network.
 
-## 7. Complete the security cleanup
+## 8. Complete the security cleanup
 
 - Confirm every compromised key is revoked, not merely removed from Git.
 - Remove keys from pull-request text, issue comments, build logs, releases, and artifacts where applicable.
@@ -203,9 +241,11 @@ Use the actual HTTPS or SSH server URL for verification. A clone made directly f
 ## Exit and safety behavior
 
 - Invalid arguments, missing files, empty key inventories, or missing rewrite dependencies stop the run.
-- Scan mode returns exit status `3` when compromised material is found and `0` only when every scanned repository is clear.
+- Scan and dry-run modes return exit status `3` when compromised material is found and `0` only when every scanned repository is clear.
+- Dry-run mode never edits anything; it reports the exact rewrite plan per matching repository.
 - Rewrite mode returns exit status `4` if any matching repository is skipped or fails verification.
-- Repositories with uncommitted changes are skipped in rewrite mode.
+- Rewrite mode requires a typed confirmation unless `--yes` is supplied, and refuses to run non-interactively without `--yes`.
+- Repositories with uncommitted changes are skipped in rewrite mode (reported as "would SKIP" in a dry run).
 - The script handles non-bare repositories represented by `.git` directories or worktree pointer files.
 - The script also handles bare and mirror repositories whose folders end in `.git`.
 - Rewrite mode performs a mirror-like origin fetch when `origin` is configured.
