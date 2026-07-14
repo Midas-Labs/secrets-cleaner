@@ -6,6 +6,32 @@ This utility scans Git repositories for compromised API keys, including keys tha
 
 Revoke or rotate all compromised keys with the API provider before using this tool. Rewriting Git history does not invalidate keys that have already been copied.
 
+Two entry points are provided:
+
+- **`secretsweep`** — an interactive TUI (built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)) that discovers repositories, finds compromised keys automatically with [Trivy](https://trivy.dev) secret scanning, and drives the cleanup engine. No hand-written key inventory needed. See [secretsweep](#secretsweep-trivy-powered-tui) below.
+- **`clean-secret-from-repos.sh`** — the cleanup engine, usable directly when you already know the compromised keys (sections 1–8 below).
+
+## secretsweep: Trivy-powered TUI
+
+```bash
+brew install trivy go
+cd secretsweep && go build -o secretsweep .
+
+# Interactive: discover repos, Trivy-scan them, review findings, clean up
+./secretsweep ~/code /backups/mirrors
+
+# Headless (automation / CI)
+./secretsweep --headless ~/code                        # Trivy + full-history scan
+./secretsweep --headless --action dry-run ~/code       # preview the rewrite
+./secretsweep --headless --action rewrite --yes ~/code # rewrite and verify
+```
+
+The TUI flow: repositories are discovered (single repos or folders, recursively), Trivy scans every working tree for secrets, findings appear in a table (severity, rule, location, masked value). From there `[s]` scans full Git history for the recovered keys, `[d]` previews the rewrite per repository, and `[r]` rewrites — after typing `rewrite` to confirm. Engine output streams into a scrollable viewport.
+
+How it works: Trivy redacts secret values in its output, so secretsweep recovers the exact key by aligning the redacted match against the raw file line, then feeds all recovered keys to `clean-secret-from-repos.sh` over all repositories — so a key spotted in one repository's working tree is also purged from every other repository's history. Secrets are written only to a `0600` temp file that is deleted when the run ends, and are always shown masked in the UI.
+
+Limitation: Trivy scans working trees, not Git history. A key that exists only in old commits is found by the engine's history scan once recovered from *some* working tree, but a key absent from every working tree must still be supplied by hand via the engine's `--key-file` (sections 1–8 below). Findings whose exact value cannot be recovered are reported for manual review.
+
 ## Requirements
 
 - macOS or Linux with Bash and Git

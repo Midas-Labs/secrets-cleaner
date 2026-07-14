@@ -2,6 +2,14 @@
 
 Status: tested and ready for controlled use on disposable mirrors before organization rollout.
 
+## secretsweep 1.0.0 (Trivy + Bubble Tea TUI)
+
+- New Go tool in `secretsweep/` built on charmbracelet/bubbletea: discovers repositories, finds compromised keys automatically with Trivy secret scanning, and drives the bash cleanup engine (history scan, dry run, rewrite) from an interactive TUI or a `--headless` mode for automation.
+- Recovers exact secret values from Trivy's redacted output by aligning the masked match against the raw file line; unrecoverable findings are flagged for manual review.
+- Feeds every recovered key to the engine across every discovered repository, so a key found in one working tree is purged from all histories.
+- Rewrite requires typing `rewrite` in the TUI (or `--yes` headless). Secrets touch disk only as a `0600` temp key file that is removed after the run; the UI always masks values.
+- Verified end to end on fixtures: Trivy found a GitHub PAT and an AWS access key, the engine rewrote three repositories (including a mirror and a history-only occurrence), and a re-scan plus full-history grep confirmed zero remaining secrets. TUI review/confirm/run/done screens exercised in a real pty via expect; unit tests cover secret recovery and deduplication.
+
 ## CLI 2.0.0
 
 - Accepts multiple target paths in one run; each path may be a single repository (working clone, worktree, bare, or mirror) or a folder searched recursively. Duplicate targets are scanned once. Defaults to the current directory.
