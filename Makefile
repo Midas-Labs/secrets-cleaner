@@ -14,19 +14,30 @@
 #
 # Runtime dependencies: trivy (secret discovery) and git-filter-repo (rewrite).
 
-GO     ?= go
-BINARY := secretsweep/secretsweep
-PATHS  ?= .
+GO      ?= go
+BINARY  := secretsweep/secretsweep
+PATHS   ?= .
+# Version stamped into the binary; falls back to the source default if untagged.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+LDFLAGS := -s -w $(if $(VERSION),-X main.version=$(VERSION))
 
-.PHONY: all build install check test vet tui scan dry-run prune clean
+.PHONY: all build install check test vet tui scan dry-run prune snapshot release-check clean
 
 all: build
 
 build:
-	cd secretsweep && $(GO) build -o secretsweep .
+	cd secretsweep && $(GO) build -ldflags "$(LDFLAGS)" -o secretsweep .
 
 install:
-	cd secretsweep && $(GO) install .
+	cd secretsweep && $(GO) install -ldflags "$(LDFLAGS)" .
+
+# Local Homebrew/release dry run (requires goreleaser); builds artifacts under ./dist.
+snapshot:
+	goreleaser release --snapshot --clean
+
+# Validate the GoReleaser configuration (requires goreleaser).
+release-check:
+	goreleaser check
 
 vet:
 	cd secretsweep && $(GO) vet ./...
@@ -53,3 +64,4 @@ endif
 
 clean:
 	rm -f $(BINARY)
+	rm -rf dist
