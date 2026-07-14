@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const version = "2.0.0"
+const version = "2.1.0"
 
 func main() {
 	var (
@@ -16,6 +16,7 @@ func main() {
 		action      = flag.String("action", "scan", "headless action: scan | dry-run | rewrite | none")
 		yes         = flag.Bool("yes", false, "confirm a headless rewrite")
 		keyFile     = flag.String("key-file", "", "file of extra exact keys to clean (one per line), in addition to Trivy findings")
+		replacement = flag.String("replacement", defaultReplacement, "plain string used to replace selected compromised values")
 		showVersion = flag.Bool("version", false, "print the version and exit")
 	)
 	flag.Usage = usage
@@ -42,7 +43,7 @@ func main() {
 		}
 		return
 	}
-	os.Exit(runHeadless(targets, extraKeys, EngineAction(*action), *yes))
+	os.Exit(runHeadless(targets, extraKeys, *replacement, EngineAction(*action), *yes))
 }
 
 func usage() {
@@ -67,6 +68,7 @@ Headless examples:
   secretsweep --headless ~/code                       # Trivy + history scan
   secretsweep --headless --action dry-run ~/code      # preview the rewrite
   secretsweep --headless --action rewrite --yes ~/code
+	secretsweep --headless --replacement REVOKED_SECRET ~/code
   secretsweep --headless --action none ~/code         # Trivy findings only
   secretsweep --headless --key-file keys.txt ~/code   # add history-only keys
 
@@ -78,7 +80,7 @@ Exit status (headless):
 `)
 }
 
-func runHeadless(targets, extraKeys []string, action EngineAction, yes bool) int {
+func runHeadless(targets, extraKeys []string, replacement string, action EngineAction, yes bool) int {
 	switch action {
 	case ActionScan, ActionDryRun, ActionRewrite, "none":
 	default:
@@ -146,9 +148,27 @@ func runHeadless(targets, extraKeys []string, action EngineAction, yes bool) int
 	if action == "none" {
 		return 3
 	}
+	plan, err := buildHeadlessPlan(findings, extraKeys, replacement)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid replacement: %v\n", err)
+		return 2
+	}
 
 	fmt.Printf("\nRunning %s over %d repositories...\n\n", action, len(repos))
-	return RunEngine(os.Stdout, action, secrets, repos)
+	return RunCleanupPlan(os.Stdout, action, plan, repos)
+}
+
+func buildHeadlessPlan(findings []Finding, extraKeys []string, replacement string) (CleanupPlan, error) {
+	recovered, _ := UniqueSecrets(findings)
+	secrets := mergeSecrets(recovered, extraKeys)
+	if err := ValidateReplacement(replacement, secrets); err != nil {
+		return CleanupPlan{}, err
+	}
+	plan := CleanupPlan{DeletePaths: make(map[string][]string)}
+	for _, secret := range secrets {
+		plan.Replacements = append(plan.Replacements, ReplacementRule{Secret: secret, With: replacement})
+	}
+	return plan, nil
 }
 
 // loadKeyFile reads one exact key per non-empty line. Blank lines and lines

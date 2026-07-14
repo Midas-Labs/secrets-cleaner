@@ -1,6 +1,8 @@
 # Change report
 
-Status: tested and ready for controlled use on disposable mirrors before organization rollout.
+Status: local review-and-cleanup workflow implemented and covered by unit, race,
+and disposable-repository integration tests. Distributed service work remains
+planned separately and is not represented as production-ready here.
 
 ## secretsweep 2.0.0 — single self-contained tool
 
@@ -20,12 +22,19 @@ binary, with the interactive TUI as the default entry point.
   in one working tree is purged from all histories.
 - **`--key-file`** supplies extra exact keys for secrets that exist only in
   history (which Trivy, a working-tree scanner, cannot see).
-- **Rewrite safety.** Requires typing `rewrite` in the TUI or `--yes` headless;
+- **Rewrite safety.** Requires an exact plan preview and typing `apply` in the
+  TUI or `--yes` headless;
   skips repositories with uncommitted changes; verifies the object database
   after rewriting; never pushes. Secrets touch disk only as a `0600` temp file
   removed after the run and are always masked in the UI.
 - **Makefile** targets: `build`, `install`, `check`, `tui`, `scan`, `dry-run`,
   and `prune` (which refuses to run without an explicit `PATHS`).
+- **Selectable review.** The split-pane report supports coloured status,
+  search, stable navigation, explicit selection, repository-scoped file
+  deletion, global replacement, and an editable validated replacement string.
+- **Testable plans.** TUI and headless execution share the same immutable
+  cleanup plan and plan-aware engine. Real temporary Git repositories verify
+  dry-run, scan, history replacement, and path deletion behavior.
 
 ### Verification performed
 
@@ -39,8 +48,9 @@ binary, with the interactive TUI as the default entry point.
 - The interactive TUI dry-run and full rewrite flows (review → confirm →
   streamed engine output → done) were exercised live in a pty; the key was
   confirmed removed afterward.
-- Go unit tests cover secret recovery, deduplication, and the model's
-  engine-streaming path through to completion.
+- Go tests cover secret recovery, stable finding identities, filtering,
+  navigation, selection, validation, safe previews, keystroke-driven model
+  behavior, secure rule files, and the engine-streaming path through completion.
 - All documented exit codes (0, 2, 3, 4) verified.
 
 ## Remaining external cleanup

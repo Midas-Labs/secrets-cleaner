@@ -76,12 +76,21 @@ The binary needs `trivy` and `git-filter-repo` on the `PATH` at runtime.
 Running `secretsweep PATH...` (or `make tui`) opens the TUI:
 
 1. **Discover** — repositories are found under the target paths.
-2. **Scan** — Trivy scans every working tree; findings appear in a table (severity, rule, location, masked value).
-3. **Review** — from the findings table:
-   - `s` — scan full Git history for the recovered keys (report only)
-   - `d` — dry-run: preview the rewrite plan per repository, nothing modified
-   - `r` — rewrite history, after typing `rewrite` to confirm
-4. **Run** — engine output streams into a scrollable viewport; the summary reports what matched, was rewritten, or was skipped.
+2. **Scan** — Trivy scans every working tree with a coloured spinner, repository progress, running finding count, and a safely masked latest-finding notification.
+3. **Review** — findings open in a searchable split pane. Nothing is selected by default:
+   - `↑`/`↓` or `j`/`k` — move through the report without losing selection
+   - `/` — search by severity, rule, repository, title, or path; `ctrl+u` clears the search
+   - `space` — cycle the current finding through **none → replace → delete file**
+   - `e` — edit the plain replacement marker (default `REMOVED_API_KEY`)
+   - `p` — review the exact cleanup plan
+   - `s` — scan full Git history for only the selected secrets
+   - `d` — execute a dry-run for the selected plan; nothing is modified
+4. **Preview and confirm** — the preview lists every repository-scoped deletion and the global replacement behavior. Continue only after typing `apply` exactly.
+5. **Run** — engine output streams into a scrollable viewport; the summary reports what matched, was rewritten, or was skipped.
+
+Selecting **replace** applies that compromised value everywhere it occurs in every discovered repository. Selecting **delete file** removes that repository-relative path from the selected repository's history and still replaces the compromised value everywhere else. Unrecovered findings remain visible for manual review but cannot be selected automatically.
+
+Replacement text must be non-empty, single-line, free of the filter-rule delimiter, and different from every compromised value found during the scan.
 
 ## Headless use
 
@@ -89,6 +98,7 @@ Running `secretsweep PATH...` (or `make tui`) opens the TUI:
 secretsweep --headless ~/code                          # Trivy + full-history scan
 secretsweep --headless --action dry-run ~/code         # preview the rewrite
 secretsweep --headless --action rewrite --yes ~/code   # rewrite and verify
+secretsweep --headless --replacement REVOKED_KEY ~/code # custom safe marker
 secretsweep --headless --action none ~/code            # Trivy findings only
 secretsweep --headless --key-file keys.txt ~/code      # add history-only keys
 ```
@@ -106,12 +116,12 @@ secretsweep --headless --key-file keys.txt ~/code      # add history-only keys
 
 Trivy redacts secret values in its output, so `secretsweep` recovers the exact key by aligning the redacted match against the raw file line. It then cleans **every recovered key across every discovered repository at once** — so a key spotted in one repository's working tree is also purged from every other repository's history.
 
-The cleanup engine, for each repository:
+The cleanup engine, for each repository selected by the reviewed plan:
 
 - Scans the **full object database** (`git cat-file --batch-all-objects`) — the authoritative check that covers history, annotated tags, commit messages, and unreachable objects, for both working clones and bare/mirror repositories.
-- Rewrites with `git filter-repo --replace-text --replace-message --sensitive-data-removal`, replacing every matched key with `REMOVED_API_KEY` across all locally available (and, when an `origin` exists, all fetchable) refs.
+- Rewrites with `git filter-repo --replace-text --replace-message --sensitive-data-removal`, replacing every selected key with the reviewed plain marker across all locally available (and, when an `origin` exists, all fetchable) refs. Selected files additionally use `--invert-paths` with validated repository-relative paths.
 - **Skips** repositories with uncommitted changes.
-- **Verifies** by re-scanning the object database, and reports a failure if any key remains.
+- **Verifies** by re-scanning the object database and reachable paths, and reports a failure if any key or selected deleted path remains.
 - **Never pushes** — you review and force-push each repository yourself.
 
 Secrets are written only to a `0600` temporary file that is deleted when the run ends, and are always shown masked in the UI.

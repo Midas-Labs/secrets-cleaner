@@ -2,7 +2,7 @@
 #
 #   make build                 build the secretsweep CLI
 #   make install               install the binary to $(go env GOPATH)/bin
-#   make check                 vet + unit tests
+#   make check                 vet + race-enabled unit/integration tests
 #   make tui PATHS=<dir...>    open the interactive TUI (the default)
 #   make scan PATHS=<dir...>   Trivy + full-history scan (report only)
 #   make dry-run PATHS=<dir...> preview the rewrite, nothing modified
@@ -18,7 +18,7 @@ GO     ?= go
 BINARY := secretsweep/secretsweep
 PATHS  ?= .
 
-.PHONY: all build install check test vet tui scan dry-run prune clean
+.PHONY: all build install check test test-race vet tui scan dry-run prune clean
 
 all: build
 
@@ -34,7 +34,10 @@ vet:
 test:
 	cd secretsweep && $(GO) test ./...
 
-check: vet test
+test-race:
+	cd secretsweep && $(GO) test -race ./...
+
+check: vet test-race
 
 tui: build
 	./$(BINARY) $(PATHS)
