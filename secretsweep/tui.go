@@ -70,9 +70,8 @@ type model struct {
 	findings  []Finding
 	scanErrs  []string
 
-	tbl           table.Model
-	confirmInput  textinput.Model
-	pendingAction EngineAction
+	tbl          table.Model
+	confirmInput textinput.Model
 
 	viewport    viewport.Model
 	engineLines []string
