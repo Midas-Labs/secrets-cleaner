@@ -1,0 +1,186 @@
+name: secretsweep
+
+services:
+  postgres:
+    image: postgres:17.5-alpine
+    read_only: true
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?generate a database password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal -d temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  temporal:
+    image: temporalio/auto-setup:1.28.1
+    read_only: true
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_SEEDS: postgres
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: ${POSTGRES_PASSWORD:?generate a database password}
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "/etc/temporal/healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  temporal-ui:
+    image: temporalio/ui:2.40.1
+    read_only: true
+    restart: unless-stopped
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://127.0.0.1:8233
+    depends_on:
+      temporal:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8233:8080"
+    tmpfs: [/tmp]
+    networks: [backend, edge]
+    security_opt: [no-new-privileges:true]
+
+  rustfs:
+    image: rustfs/rustfs:1.0.0-alpha.60
+    read_only: true
+    restart: unless-stopped
+    environment:
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: 0.0.0.0:9000
+      RUSTFS_CONSOLE_ENABLE: "false"
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?generate an object-store access key}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?generate an object-store secret key}
+    volumes:
+      - rustfs-data:/data
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -fsS http://localhost:9000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  rustfs-init:
+    image: minio/mc:RELEASE.2025-05-21T01-59-54Z
+    read_only: true
+    restart: "no"
+    environment:
+      RUSTFS_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?generate an object-store access key}
+      RUSTFS_SECRET_KEY: ${RUSTFS_SECRET_KEY:?generate an object-store secret key}
+    depends_on:
+      rustfs:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        mc alias set local http://rustfs:9000 "$$RUSTFS_ACCESS_KEY" "$$RUSTFS_SECRET_KEY"
+        mc mb --ignore-existing local/automq-data
+        mc mb --ignore-existing local/automq-ops
+    tmpfs: [/tmp]
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  automq:
+    image: automqinc/automq:1.6.0
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 1m
+    environment:
+      KAFKA_S3_ACCESS_KEY: ${RUSTFS_ACCESS_KEY:?generate an object-store access key}
+      KAFKA_S3_SECRET_KEY: ${RUSTFS_SECRET_KEY:?generate an object-store secret key}
+      AWS_ACCESS_KEY_ID: ${RUSTFS_ACCESS_KEY:?generate an object-store access key}
+      AWS_SECRET_ACCESS_KEY: ${RUSTFS_SECRET_KEY:?generate an object-store secret key}
+      KAFKA_HEAP_OPTS: -Xms512m -Xmx1g -XX:MaxDirectMemorySize=512m
+      CLUSTER_ID: ${AUTOMQ_CLUSTER_ID:?generate with kafka-storage.sh random-uuid}
+    command:
+      - bash
+      - -ec
+      - |
+        /opt/automq/kafka/bin/kafka-server-start.sh \
+          /opt/automq/kafka/config/kraft/server.properties \
+          --override cluster.id="$$CLUSTER_ID" \
+          --override node.id=0 \
+          --override controller.quorum.voters=0@automq:9093 \
+          --override controller.quorum.bootstrap.servers=automq:9093 \
+          --override advertised.listeners=PLAINTEXT://automq:9092 \
+          --override s3.data.buckets='0@s3://automq-data?region=us-east-1&endpoint=http://rustfs:9000&pathStyle=true' \
+          --override s3.ops.buckets='1@s3://automq-ops?region=us-east-1&endpoint=http://rustfs:9000&pathStyle=true' \
+          --override s3.wal.path='0@s3://automq-data?region=us-east-1&endpoint=http://rustfs:9000&pathStyle=true'
+    depends_on:
+      rustfs:
+        condition: service_healthy
+      rustfs-init:
+        condition: service_completed_successfully
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "/opt/automq/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 45s
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  openbao:
+    image: openbao/openbao:2.3.1
+    read_only: true
+    restart: unless-stopped
+    command: ["server", "-config=/openbao/config/server.hcl"]
+    cap_drop: [ALL]
+    cap_add: [IPC_LOCK]
+    volumes:
+      - ./openbao.hcl:/openbao/config/server.hcl:ro
+      - openbao-data:/openbao/data
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "sh", "-c", "bao status >/dev/null 2>&1 || [ $$? -eq 2 ]"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.130.1
+    read_only: true
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    tmpfs: [/tmp]
+    networks: [backend]
+    security_opt: [no-new-privileges:true]
+
+networks:
+  backend:
+    internal: true
+  edge:
+
+volumes:
+  postgres-data:
+  rustfs-data:
+  openbao-data:
