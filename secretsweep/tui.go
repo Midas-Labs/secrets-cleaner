@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
-	"io"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -57,8 +55,8 @@ type engineEvMsg struct {
 }
 
 type model struct {
-	targets    []string
-	enginePath string
+	targets   []string
+	extraKeys []string
 
 	phase   phase
 	spinner spinner.Model
@@ -82,7 +80,7 @@ type model struct {
 	err error
 }
 
-func newModel(targets []string, enginePath string) model {
+func newModel(targets, extraKeys []string) model {
 	sp := spinner.New()
 	sp.Spinner = spinner.Dot
 	sp.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("212"))
@@ -96,13 +94,20 @@ func newModel(targets []string, enginePath string) model {
 
 	return model{
 		targets:      targets,
-		enginePath:   enginePath,
+		extraKeys:    extraKeys,
 		phase:        phaseDiscover,
 		spinner:      sp,
 		confirmInput: ti,
 		viewport:     vp,
 		engineExit:   -1,
 	}
+}
+
+// allSecrets is the full set of keys to act on: those recovered from Trivy
+// findings plus any supplied via --key-file.
+func (m model) allSecrets() []string {
+	recovered, _ := UniqueSecrets(m.findings)
+	return mergeSecrets(recovered, m.extraKeys)
 }
 
 func (m model) Init() tea.Cmd {
@@ -124,51 +129,52 @@ func scanCmd(repo string, index int) tea.Cmd {
 }
 
 func (m *model) startEngine(action EngineAction) tea.Cmd {
-	secrets, _ := UniqueSecrets(m.findings)
-	cmd, cleanup, err := BuildEngineCmd(m.enginePath, action, secrets, m.repos)
-	if err != nil {
-		m.err = err
-		m.phase = phaseDone
+	secrets := m.allSecrets()
+	if len(secrets) == 0 {
 		return nil
 	}
-	ch := make(chan engineEvMsg, 64)
+	ch := make(chan engineEvMsg, 256)
 	m.engineCh = ch
 	m.engineLines = nil
 	m.ranAction = action
 	m.phase = phaseRun
 
-	pr, pw := io.Pipe()
-	cmd.Stdout = pw
-	cmd.Stderr = pw
-	if err := cmd.Start(); err != nil {
-		cleanup()
-		m.err = err
-		m.phase = phaseDone
-		return nil
-	}
-	exitCh := make(chan int, 1)
+	repos := m.repos
 	go func() {
-		err := cmd.Wait()
-		code := 0
-		if ee, ok := err.(*exec.ExitError); ok {
-			code = ee.ExitCode()
-		} else if err != nil {
-			code = -1
-		}
-		pw.Close()
-		exitCh <- code
-	}()
-	go func() {
-		defer cleanup()
-		scanner := bufio.NewScanner(pr)
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			ch <- engineEvMsg{line: scanner.Text()}
-		}
-		ch <- engineEvMsg{done: true, exit: <-exitCh}
+		w := &channelWriter{ch: ch}
+		code := RunEngine(w, action, secrets, repos)
+		w.flush()
+		ch <- engineEvMsg{done: true, exit: code}
 		close(ch)
 	}()
 	return listenEngine(ch)
+}
+
+// channelWriter is an io.Writer that forwards each complete line written to it
+// as an engineEvMsg on ch, so RunEngine's streamed output feeds the viewport.
+type channelWriter struct {
+	ch  chan engineEvMsg
+	buf []byte
+}
+
+func (w *channelWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		w.ch <- engineEvMsg{line: string(w.buf[:i])}
+		w.buf = w.buf[i+1:]
+	}
+	return len(p), nil
+}
+
+func (w *channelWriter) flush() {
+	if len(w.buf) > 0 {
+		w.ch <- engineEvMsg{line: string(w.buf)}
+		w.buf = nil
+	}
 }
 
 func listenEngine(ch chan engineEvMsg) tea.Cmd {
@@ -212,8 +218,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if !TrivyAvailable() {
-			m.err = fmt.Errorf("trivy is not installed; install it with: brew install trivy")
-			m.phase = phaseDone
+			if len(m.extraKeys) == 0 {
+				m.err = fmt.Errorf("trivy is not installed; install it with: brew install trivy (or pass --key-file)")
+				m.phase = phaseDone
+				return m, nil
+			}
+			// No Trivy, but --key-file supplied: skip discovery, act on those keys.
+			m.phase = phaseReview
+			m.rebuildTable()
 			return m, nil
 		}
 		m.phase = phaseScan
@@ -274,12 +286,22 @@ func (m model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "q", "ctrl+c", "esc":
 			return m, tea.Quit
 		case "s":
+			if len(m.allSecrets()) == 0 {
+				return m, nil
+			}
 			return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionScan))
 		case "d":
+			if len(m.allSecrets()) == 0 {
+				return m, nil
+			}
 			return m, tea.Batch(m.spinner.Tick, m.startEngine(ActionDryRun))
 		case "r":
-			secrets, _ := UniqueSecrets(m.findings)
-			if len(secrets) == 0 {
+			if len(m.allSecrets()) == 0 {
+				return m, nil
+			}
+			if !FilterRepoAvailable() {
+				m.err = fmt.Errorf("rewrite requires git-filter-repo; install it with: brew install git-filter-repo")
+				m.phase = phaseDone
 				return m, nil
 			}
 			m.phase = phaseConfirm
@@ -381,41 +403,49 @@ func (m model) View() string {
 
 	switch m.phase {
 	case phaseDiscover:
-		b.WriteString(fmt.Sprintf("%s Discovering Git repositories under %s ...\n", m.spinner.View(), strings.Join(m.targets, ", ")))
+		fmt.Fprintf(&b, "%s Discovering Git repositories under %s ...\n", m.spinner.View(), strings.Join(m.targets, ", "))
 
 	case phaseScan:
-		b.WriteString(fmt.Sprintf("%s Trivy secret scan  [%d/%d]  %s\n",
-			m.spinner.View(), m.scanIndex+1, len(m.repos), m.repos[m.scanIndex]))
+		fmt.Fprintf(&b, "%s Trivy secret scan  [%d/%d]  %s\n",
+			m.spinner.View(), m.scanIndex+1, len(m.repos), m.repos[m.scanIndex])
 
 	case phaseReview:
-		secrets, unrecovered := UniqueSecrets(m.findings)
-		b.WriteString(fmt.Sprintf("Repositories: %d    Findings: %d    Distinct secrets: %d\n",
-			len(m.repos), len(m.findings), len(secrets)))
+		all := m.allSecrets()
+		_, unrecovered := UniqueSecrets(m.findings)
+		fmt.Fprintf(&b, "Repositories: %d    Findings: %d    Distinct secrets: %d\n",
+			len(m.repos), len(m.findings), len(all))
 		if unrecovered > 0 {
 			b.WriteString(styleWarn.Render(fmt.Sprintf("%d finding(s) could not be auto-recovered; review them manually.", unrecovered)) + "\n")
+		}
+		if len(m.extraKeys) > 0 {
+			b.WriteString(styleSubtle.Render(fmt.Sprintf("%d key(s) supplied via --key-file.", len(m.extraKeys))) + "\n")
 		}
 		for _, e := range m.scanErrs {
 			b.WriteString(styleWarn.Render("scan error: "+e) + "\n")
 		}
 		b.WriteString("\n")
-		if len(m.findings) == 0 {
+		if len(all) == 0 {
 			b.WriteString(styleOK.Render("No secrets found in any working tree.") + "\n\n")
-			b.WriteString(styleHelp.Render("[s] deep-scan history anyway requires keys — none recovered   [q] quit") + "\n")
+			b.WriteString(styleHelp.Render("[q] quit") + "\n")
 		} else {
-			b.WriteString(m.tbl.View() + "\n\n")
+			if len(m.findings) > 0 {
+				b.WriteString(m.tbl.View() + "\n\n")
+			} else {
+				b.WriteString(styleSubtle.Render("Acting on --key-file keys (no working-tree findings).") + "\n\n")
+			}
 			b.WriteString(styleHelp.Render("[s] scan full history   [d] dry-run rewrite   [r] rewrite history   [↑/↓] browse   [q] quit") + "\n")
 		}
 
 	case phaseConfirm:
-		secrets, _ := UniqueSecrets(m.findings)
+		secrets := m.allSecrets()
 		b.WriteString(styleDanger.Render("Rewrite mode permanently rewrites Git history in every matching repository.") + "\n")
-		b.WriteString(fmt.Sprintf("%d distinct secret(s) across %d repositories will be replaced with REMOVED_API_KEY.\n", len(secrets), len(m.repos)))
+		fmt.Fprintf(&b, "%d distinct secret(s) across %d repositories will be replaced with REMOVED_API_KEY.\n", len(secrets), len(m.repos))
 		b.WriteString("Confirm the keys are revoked and backups exist.\n\n")
 		b.WriteString("Type \"rewrite\" to continue, esc to go back:\n")
 		b.WriteString(m.confirmInput.View() + "\n")
 
 	case phaseRun:
-		b.WriteString(fmt.Sprintf("%s Engine %s in progress...\n", m.spinner.View(), m.ranAction))
+		fmt.Fprintf(&b, "%s Engine %s in progress...\n", m.spinner.View(), m.ranAction)
 		b.WriteString(styleViewport.Render(m.viewport.View()) + "\n")
 		b.WriteString(styleHelp.Render("[↑/↓] scroll   ctrl+c abort") + "\n")
 
@@ -449,8 +479,8 @@ func (m model) View() string {
 	return b.String()
 }
 
-func runTUI(targets []string, enginePath string) error {
-	p := tea.NewProgram(newModel(targets, enginePath), tea.WithAltScreen())
+func runTUI(targets, extraKeys []string) error {
+	p := tea.NewProgram(newModel(targets, extraKeys), tea.WithAltScreen())
 	_, err := p.Run()
 	return err
 }

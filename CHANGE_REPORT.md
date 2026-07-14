@@ -2,57 +2,50 @@
 
 Status: tested and ready for controlled use on disposable mirrors before organization rollout.
 
-## Makefile
+## secretsweep 2.0.0 — single self-contained tool
 
-- `make build` / `make check` build and verify the secretsweep CLI; `make tui`, `make scan`, and `make dry-run` run it over `PATHS` (default: current directory).
-- `make prune PATHS=...` is the one-command cleanup: build, Trivy discovery, history rewrite, and verification. It refuses to run without an explicit `PATHS` because the rewrite is irreversible.
-- Verified: prune over a re-seeded fixture removed the planted key from all history; a report-only scan of this project's repositories found zero secrets.
+The Bash engine (`clean-secret-from-repos.sh`) has been removed. All scanning,
+previewing, and rewriting now happens natively inside the Go `secretsweep`
+binary, with the interactive TUI as the default entry point.
 
-## secretsweep 1.0.0 (Trivy + Bubble Tea TUI)
+- **Native engine.** Full object-database scanning (`git cat-file
+  --batch-all-objects`), dry-run planning, and rewriting via `git filter-repo`
+  are implemented in Go (`engine.go`). No external script is required at
+  runtime; the only runtime dependencies are `trivy` and `git-filter-repo`.
+- **Trivy discovery.** Repositories are discovered under any number of target
+  paths (single repos or folders, deduplicated), Trivy finds secrets, and their
+  exact values are recovered from Trivy's redacted output by aligning the masked
+  match against the raw file line.
+- **Cleans every recovered key across every repository at once**, so a key found
+  in one working tree is purged from all histories.
+- **`--key-file`** supplies extra exact keys for secrets that exist only in
+  history (which Trivy, a working-tree scanner, cannot see).
+- **Rewrite safety.** Requires typing `rewrite` in the TUI or `--yes` headless;
+  skips repositories with uncommitted changes; verifies the object database
+  after rewriting; never pushes. Secrets touch disk only as a `0600` temp file
+  removed after the run and are always masked in the UI.
+- **Makefile** targets: `build`, `install`, `check`, `tui`, `scan`, `dry-run`,
+  and `prune` (which refuses to run without an explicit `PATHS`).
 
-- New Go tool in `secretsweep/` built on charmbracelet/bubbletea: discovers repositories, finds compromised keys automatically with Trivy secret scanning, and drives the bash cleanup engine (history scan, dry run, rewrite) from an interactive TUI or a `--headless` mode for automation.
-- Recovers exact secret values from Trivy's redacted output by aligning the masked match against the raw file line; unrecoverable findings are flagged for manual review.
-- Feeds every recovered key to the engine across every discovered repository, so a key found in one working tree is purged from all histories.
-- Rewrite requires typing `rewrite` in the TUI (or `--yes` headless). Secrets touch disk only as a `0600` temp key file that is removed after the run; the UI always masks values.
-- Verified end to end on fixtures: Trivy found a GitHub PAT and an AWS access key, the engine rewrote three repositories (including a mirror and a history-only occurrence), and a re-scan plus full-history grep confirmed zero remaining secrets. TUI review/confirm/run/done screens exercised in a real pty via expect; unit tests cover secret recovery and deduplication.
+### Verification performed
 
-## CLI 2.0.0
-
-- Accepts multiple target paths in one run; each path may be a single repository (working clone, worktree, bare, or mirror) or a folder searched recursively. Duplicate targets are scanned once. Defaults to the current directory.
-- `--dry-run` mode: full scan plus the exact per-repository rewrite plan (would rewrite or would skip, including the `git filter-repo` command), with nothing modified.
-- `--list` mode: prints the repositories a run would cover without requiring key input.
-- `--no-recurse`: requires every path to be a repository itself.
-- Rewrite mode asks for a typed confirmation (`rewrite`); `--yes` skips it for unattended runs, and non-interactive runs without `--yes` are refused.
-- Colored MATCH/clear output with `[n/N]` progress counters; disabled via `--no-color`, the `NO_COLOR` environment variable, or when stdout is not a terminal.
-- Options may appear anywhere on the command line; `--key-file=FILE` form, `--version`, expanded `--help` with examples, and conflicting-mode detection added.
-- Verified on macOS Bash 3.2: scan/dry-run/rewrite against fixtures covering clean, infected, dirty-working-tree, bare-mirror, and no-origin repositories, exact and masked keys, and all documented exit codes (0, 2, 3, 4).
-
-## Current capabilities
-
-- Discovers ordinary, worktree, bare, and mirror Git repositories below any number of target folders, or accepts repositories directly as targets.
-- Accepts multiple exact compromised keys.
-- Accepts masked patterns using runs of two or more asterisks at the start, middle, end, or both ends.
-- Requires at least four visible characters in each mask.
-- Treats `literal:` entries as exact values when a key genuinely contains `**`.
-- Audits working files, every local ref, all reachable commits, commit messages, annotated tags, and unreachable Git objects.
-- Lists and counts every infected branch.
-- Uses sensitive-data-removal mode to fetch and rewrite all fetchable `origin` refs.
-- Verifies the complete remaining local object database after rewriting.
-- Returns a nonzero status when infection remains or a rewrite is skipped.
-- Never pushes automatically.
-
-## Verification performed
-
-- Exact-key scan and rewrite across multiple repositories.
-- Mirror clone scan, all-ref rewrite, force-push to a disposable remote, and fresh protocol clone verification.
-- Prefix, suffix, prefix-and-suffix, middle, and literal-asterisk key patterns.
-- Variable display-mask lengths such as `tok2***i72i`; a 2+ asterisk run represents one unknown segment.
-- File-content and commit-message cleanup.
-- Configuration structure preservation around every masked replacement.
-- Rejection of masks exposing fewer than four characters.
-
-The successful fresh-mirror result was zero matching repositories, zero infected branches, and a clear Git object database.
+- Native headless scan / dry-run / rewrite over fixtures covering ordinary,
+  bare-mirror, no-origin, dirty-working-tree, and history-only-key repositories.
+- Trivy found a GitHub PAT and an AWS access key; the engine rewrote three
+  repositories (including a mirror and a key present only in another repo's
+  history) and a re-scan plus full object-database grep confirmed zero remaining
+  secrets.
+- `--key-file` cleaned a history-only key that Trivy does not recognize.
+- The interactive TUI dry-run and full rewrite flows (review → confirm →
+  streamed engine output → done) were exercised live in a pty; the key was
+  confirmed removed afterward.
+- Go unit tests cover secret recovery, deduplication, and the model's
+  engine-streaming path through to completion.
+- All documented exit codes (0, 2, 3, 4) verified.
 
 ## Remaining external cleanup
 
-Repository rewriting cannot revoke credentials or guarantee deletion from provider caches, pull-request views, forks, build logs, releases, artifacts, backups, or existing clones. Revoke every key first and follow the hosting provider's sensitive-data-removal procedure after publishing rewritten refs.
+Repository rewriting cannot revoke credentials or guarantee deletion from
+provider caches, pull-request views, forks, build logs, releases, artifacts,
+backups, or existing clones. Revoke every key first and follow the hosting
+provider's sensitive-data-removal procedure after publishing rewritten refs.
