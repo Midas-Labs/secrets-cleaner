@@ -1,39 +1,85 @@
 # Compromised API Key Cleanup
 
-This utility scans Git repositories for compromised API keys, including keys that exist only in earlier commits, branch histories, tags, commit messages, and unreachable local Git objects. It accepts one or more target paths; each path may be a single repository (working clone, worktree, bare, or mirror) or a folder that is searched recursively. After a report-only scan and an optional dry run of the rewrite plan, it can replace every confirmed compromised key across all fetched refs and verify the complete local object database.
+Find compromised API keys across many Git repositories — including keys that exist only in earlier commits, branch histories, tags, commit messages, and unreachable Git objects — and remove them from history. Targets can be a single repository (working clone, worktree, bare, or mirror), a folder searched recursively, or any mix of the two.
 
-`CHANGE_REPORT.md` records the current implementation and verification status. The `archive` folder contains the earlier report snapshot and is retained only for history; it is superseded by the current README and change report.
+The project provides two tools that work together:
 
-Revoke or rotate all compromised keys with the API provider before using this tool. Rewriting Git history does not invalidate keys that have already been copied.
+| Tool | Use it when |
+|---|---|
+| **`secretsweep`** | You want keys **discovered automatically**. A [Bubble Tea](https://github.com/charmbracelet/bubbletea) TUI that finds secrets with [Trivy](https://trivy.dev), then drives the engine to scan history, preview, and rewrite. No hand-written key list needed. |
+| **`clean-secret-from-repos.sh`** | You **already know** the compromised keys. The low-level engine that scans, previews, and rewrites history against a supplied key inventory. `secretsweep` calls this under the hood. |
 
-Two entry points are provided:
+> **Revoke or rotate every compromised key with its provider first.** Rewriting Git history does not invalidate a key that has already been copied. Rewriting shared history also changes commit IDs — coordinate with collaborators and back up first.
 
-- **`secretsweep`** — an interactive TUI (built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)) that discovers repositories, finds compromised keys automatically with [Trivy](https://trivy.dev) secret scanning, and drives the cleanup engine. No hand-written key inventory needed. See [secretsweep](#secretsweep-trivy-powered-tui) below.
-- **`clean-secret-from-repos.sh`** — the cleanup engine, usable directly when you already know the compromised keys (sections 1–8 below).
+## Repository layout
+
+```
+clean-secret-from-repos.sh   # the cleanup engine (Bash)
+secretsweep/                 # Trivy + Bubble Tea TUI (Go)
+Makefile                     # build the CLI and run scan / dry-run / prune
+CHANGE_REPORT.md             # implementation and verification status
+LICENSE                      # Apache License 2.0
+```
+
+## Quick start
+
+```bash
+brew install trivy go git-filter-repo   # dependencies
+make build                              # build secretsweep/secretsweep
+
+make scan    PATHS=~/code               # find keys, report only
+make dry-run PATHS=~/code               # preview the rewrite, nothing changes
+make prune   PATHS=~/code               # find keys and rewrite history
+
+make tui     PATHS=~/code               # or drive it all interactively
+```
 
 ## secretsweep: Trivy-powered TUI
 
+The `Makefile` wraps the common flows. Each accepts `PATHS` (one or more repositories or folders, space separated; defaults to the current directory):
+
 ```bash
-brew install trivy go
-make build                                # builds secretsweep/secretsweep
-
-# Interactive: discover repos, Trivy-scan them, review findings, clean up
-make tui PATHS="~/code /backups/mirrors"
-
-# Headless (automation / CI)
-make scan PATHS=~/code                    # Trivy + full-history scan
-make dry-run PATHS=~/code                 # preview the rewrite
-make prune PATHS=~/code                   # find keys and rewrite history
-
+make build                                # build secretsweep/secretsweep
+make tui     PATHS="~/code /backups"      # interactive: discover, scan, review, clean
+make scan    PATHS=~/code                 # Trivy + full-history scan (report only)
+make dry-run PATHS=~/code                 # preview the rewrite, nothing changes
+make prune   PATHS=~/code                 # find keys and rewrite history
 make check                                # go vet + unit tests
 ```
 
-`make prune` is the one-command cleanup: it builds the CLI, finds compromised keys with Trivy, rewrites every matching history, and verifies the result. Because it is irreversible, it refuses to run without an explicit `PATHS=`. The binary can also be invoked directly:
+`make prune` is the one-command cleanup: it builds the CLI, finds compromised keys with Trivy, rewrites every matching history, and verifies the result. Because it is irreversible, it refuses to run without an explicit `PATHS=`.
+
+### Build and install the binary
+
+`make build` compiles the CLI to `secretsweep/secretsweep`. To build it by hand, or to place it on your `PATH` so you can launch the TUI from anywhere:
 
 ```bash
-./secretsweep/secretsweep ~/code /backups/mirrors      # TUI
-./secretsweep/secretsweep --headless --action rewrite --yes ~/code
+# Build in place (produces ./secretsweep/secretsweep)
+cd secretsweep && go build -o secretsweep .
+
+# Or install to your Go bin directory (usually ~/go/bin, which should be on PATH)
+cd secretsweep && go install .
 ```
+
+`go install` places a `secretsweep` binary in `$(go env GOPATH)/bin`. Once that directory is on your `PATH`, launch the TUI from any folder:
+
+```bash
+secretsweep ~/code /backups/mirrors     # opens the interactive TUI
+```
+
+The binary needs `trivy` (secret discovery) and `git-filter-repo` (rewrite) available on the `PATH` at runtime, and it locates `clean-secret-from-repos.sh` next to itself or in the working directory — pass `--engine /path/to/clean-secret-from-repos.sh` if you install the binary away from the script.
+
+### Running it directly
+
+```bash
+secretsweep ~/code /backups/mirrors                    # TUI
+secretsweep --headless ~/code                          # Trivy + full-history scan
+secretsweep --headless --action dry-run ~/code         # preview the rewrite
+secretsweep --headless --action rewrite --yes ~/code   # rewrite and verify
+secretsweep --headless --action none ~/code            # Trivy findings only
+```
+
+Headless exit status mirrors the engine: `0` clear, `2` usage/environment error, `3` compromised material found (scan or dry-run), `4` a rewrite was skipped or failed.
 
 The TUI flow: repositories are discovered (single repos or folders, recursively), Trivy scans every working tree for secrets, findings appear in a table (severity, rule, location, masked value). From there `[s]` scans full Git history for the recovered keys, `[d]` previews the rewrite per repository, and `[r]` rewrites — after typing `rewrite` to confirm. Engine output streams into a scrollable viewport.
 
@@ -43,19 +89,27 @@ Limitation: Trivy scans working trees, not Git history. A key that exists only i
 
 ## Requirements
 
+Base (both tools):
+
 - macOS or Linux with Bash and Git
 - [`git-filter-repo`](https://github.com/newren/git-filter-repo) for rewrite mode
 - Clean working trees in repositories that will be rewritten
 - A backup of the repositories and coordination with their collaborators
 - Network and repository permissions sufficient to fetch and replace every remote branch
 
-On macOS, install the rewrite dependency with:
+Additional, for `secretsweep`:
+
+- [Go](https://go.dev) 1.21 or newer, to build the binary
+- [Trivy](https://trivy.dev), for automatic secret discovery
+
+On macOS, install the dependencies with:
 
 ```bash
-brew install git-filter-repo
+brew install git-filter-repo    # engine rewrite mode
+brew install go trivy           # secretsweep build + discovery
 ```
 
-Make the script executable if needed:
+The engine script is committed executable; make it executable again if your checkout dropped the bit:
 
 ```bash
 chmod +x clean-secret-from-repos.sh
@@ -288,3 +342,7 @@ Use the actual HTTPS or SSH server URL for verification. A clone made directly f
 - No remote is modified unless an operator explicitly runs the force-push commands.
 
 Use `./clean-secret-from-repos.sh --help` for the command summary.
+
+## License
+
+Licensed under the Apache License 2.0. See [`LICENSE`](LICENSE).
